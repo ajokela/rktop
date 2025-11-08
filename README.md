@@ -272,16 +272,6 @@ From profiling with `strace -c`:
 - Minimal file I/O through aggressive caching
 - <1% CPU usage on RK3588 (Orange Pi 5 Max)
 
-### Comparison: Python vs Rust
-
-| Metric | Python (yarktop) | Rust (rktop) |
-|--------|------------------|--------------|
-| CPU Usage | ~2-3% | <1% |
-| Startup Time | ~1s | <0.1s |
-| Memory | ~40MB | ~3MB |
-| Process Spawns/sec | 0-2 (cached) | 0 |
-| Language | Interpreted | Compiled |
-
 ## Technical Details
 
 ### Process Monitoring
@@ -314,8 +304,7 @@ From profiling with `strace -c`:
 
 ## Related Projects
 
-- **yarktop** - Python-based predecessor (see `yarktop/` directory)
-- Optimizations documented in `OPTIMIZATIONS.md`
+- **yarktop** - Python-based predecessor (available in separate repository)
 
 ## License
 
