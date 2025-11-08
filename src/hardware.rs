@@ -1,8 +1,7 @@
 use regex::Regex;
-use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use goblin::Object;
 
 /// Read GPU utilization from Mali debugfs
 pub fn get_gpu_usage() -> Option<f32> {
@@ -236,41 +235,60 @@ pub fn get_npu_driver_version() -> String {
     "Not Detected".to_string()
 }
 
-/// Read librknnrt library version
-pub fn get_librknnrt_version() -> String {
-    if let Ok(output) = Command::new("sh")
-        .arg("-c")
-        .arg("strings /usr/lib/librknnrt.so 2>/dev/null | grep 'librknnrt version:'")
-        .output()
-    {
-        if output.status.success() {
-            let result = String::from_utf8_lossy(&output.stdout);
-            // Extract just the version number (e.g., "1.6.0")
-            let re = Regex::new(r"(\d+\.\d+\.\d+)").unwrap();
-            if let Some(cap) = re.captures(&result) {
-                return cap[1].to_string();
+/// Extract version string from binary using goblin
+fn extract_version_from_binary(path: &str, pattern: &str) -> String {
+    // Try to read the binary file
+    let buffer = match fs::read(path) {
+        Ok(buf) => buf,
+        Err(_) => return "Not Detected".to_string(),
+    };
+
+    // Parse the binary with goblin
+    let obj = match Object::parse(&buffer) {
+        Ok(obj) => obj,
+        Err(_) => return "Not Detected".to_string(),
+    };
+
+    // For ELF binaries, search through the .rodata section
+    if let Object::Elf(elf) = obj {
+        for section in elf.section_headers.iter() {
+            // Look in .rodata or any section that might contain strings
+            if let Some(name) = elf.shdr_strtab.get_at(section.sh_name) {
+                if name == ".rodata" || name.contains("data") {
+                    let start = section.sh_offset as usize;
+                    let end = start + section.sh_size as usize;
+
+                    if end <= buffer.len() {
+                        let section_data = &buffer[start..end];
+
+                        // Convert to lossy UTF-8 and search for pattern
+                        let text = String::from_utf8_lossy(section_data);
+
+                        // Find the pattern and extract version number
+                        if let Some(pos) = text.find(pattern) {
+                            let substr = &text[pos..];
+                            let re = Regex::new(r"(\d+\.\d+\.\d+)").unwrap();
+                            if let Some(cap) = re.captures(substr) {
+                                return cap[1].to_string();
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+
     "Not Detected".to_string()
+}
+
+/// Read librknnrt library version
+pub fn get_librknnrt_version() -> String {
+    extract_version_from_binary("/usr/lib/librknnrt.so", "librknnrt version:")
 }
 
 /// Read librkllmrt library version
 pub fn get_librkllmrt_version() -> String {
-    if let Ok(output) = Command::new("sh")
-        .arg("-c")
-        .arg("strings /usr/lib/librkllmrt.so 2>/dev/null | grep 'RKLLM SDK (version: '")
-        .output()
-    {
-        if output.status.success() {
-            let result = String::from_utf8_lossy(&output.stdout);
-            let re = Regex::new(r"version:\s*([\d.]+)").unwrap();
-            if let Some(cap) = re.captures(&result) {
-                return cap[1].to_string();
-            }
-        }
-    }
-    "Not Detected".to_string()
+    extract_version_from_binary("/usr/lib/librkllmrt.so", "RKLLM SDK (version:")
 }
 
 /// Read temperature sensors from both thermal_zone and hwmon
