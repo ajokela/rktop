@@ -244,7 +244,7 @@ The tool needs access to debugfs. Either:
 ### Version detection fails
 - Ensure runtime libraries are installed in `/usr/lib/`
 - Library paths may vary by distribution
-- Uses `strings` command to extract versions
+- Parses binary ELF files directly to extract versions
 
 ### High CPU usage
 - Normal usage should be <1% CPU
@@ -299,7 +299,7 @@ From profiling with `strace -c`:
 
 - **Rockchip-specific**: Some features only work on Rockchip SoCs
 - **Debugfs access**: Requires root or capabilities for full functionality
-- **Library versions**: Depends on `strings` command and library paths
+- **Library versions**: Library paths may vary by distribution
 - **No NPU process mapping**: Cannot show which process uses which NPU core (kernel limitation)
 
 ## Related Projects
