@@ -304,7 +304,7 @@ From profiling with `strace -c`:
 
 ## Related Projects
 
-- **yarktop** - Python-based predecessor (available in separate repository)
+- **[yarktop](https://github.com/emapco/yarktop)** - Python-based predecessor
 
 ## License
 
