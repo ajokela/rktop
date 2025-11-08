@@ -1,0 +1,21 @@
+# Rust
+/target
+Cargo.lock
+
+# Python version (separate project)
+/yarktop/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.orig
