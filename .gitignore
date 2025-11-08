@@ -5,6 +5,9 @@ Cargo.lock
 # Python version (separate project)
 /yarktop/
 
+# Claude Code development instructions (local only)
+CLAUDE.md
+
 # IDE
 .vscode/
 .idea/
