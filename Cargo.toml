@@ -2,6 +2,13 @@
 name = "rktop"
 version = "0.1.0"
 edition = "2021"
+authors = ["Alex Jokela <alex@camulus.com>"]
+license = "BSD-3-Clause"
+description = "High-performance system monitor for Rockchip SoCs (RK3588, RK3399) with real-time CPU, GPU, NPU, RGA, memory, and process monitoring"
+repository = "https://github.com/ajokela/rktop"
+readme = "README.md"
+keywords = ["rockchip", "system-monitor", "rk3588", "embedded", "tui"]
+categories = ["command-line-utilities", "embedded"]
 
 [dependencies]
 ratatui = "0.28"
