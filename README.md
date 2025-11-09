@@ -48,14 +48,24 @@ Optimized for minimal CPU overhead:
 
 - Rockchip SoC-based device (RK3588, RK3399, etc.)
 - Linux with sysfs and debugfs mounted
-- Rust toolchain (for building from source)
+- Rust toolchain (for installing from crates.io or building from source)
+
+### Install from crates.io
+
+The easiest way to install rktop is via cargo:
+
+```bash
+cargo install rktop
+```
+
+This will download, compile, and install the latest version from [crates.io](https://crates.io/crates/rktop).
 
 ### Building from Source
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd rk_top
+git clone https://github.com/ajokela/rktop.git
+cd rktop
 
 # Build release binary
 cargo build --release
@@ -66,10 +76,11 @@ cargo build --release
 ### Installing System-Wide
 
 ```bash
-# Copy binary to system path
-sudo cp target/release/rktop /usr/local/bin/
+# If installed via cargo
+# Binary is already in ~/.cargo/bin/ (ensure it's in your PATH)
 
-# Make executable
+# If built from source, copy to system path
+sudo cp target/release/rktop /usr/local/bin/
 sudo chmod +x /usr/local/bin/rktop
 ```
 
