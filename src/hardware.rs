@@ -8,7 +8,7 @@ pub fn get_gpu_usage() -> Option<f32> {
     let path = "/sys/kernel/debug/mali0/dvfs_utilization";
     if let Ok(content) = fs::read_to_string(path) {
         // Parse "busy_time: X idle_time: Y" format
-        let parts: Vec<&str> = content.trim().split_whitespace().collect();
+        let parts: Vec<&str> = content.split_whitespace().collect();
         let mut busy_time = 0u64;
         let mut idle_time = 0u64;
 
