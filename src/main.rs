@@ -93,6 +93,8 @@ struct AppState {
     has_gpu: bool,
     has_npu: bool,
     has_rga: bool,
+    // Cached CPU frequency ranges (don't change at runtime)
+    cpu_freq_ranges: Vec<(u32, u32)>,
     // Cached stats (updated periodically, not every frame)
     cpu_governor: String,
     tcp_connections: usize,
@@ -133,6 +135,9 @@ impl AppState {
         let has_npu = !get_npu_load().is_empty();
         let has_rga = get_rga_load().is_some();
 
+        // Cache CPU frequency ranges (don't change at runtime)
+        let cpu_freq_ranges = get_cpu_freq_ranges();
+
         Self {
             prev_disk_read: 0,
             prev_disk_write: 0,
@@ -154,6 +159,7 @@ impl AppState {
             has_gpu,
             has_npu,
             has_rga,
+            cpu_freq_ranges,
             cpu_governor: String::new(),
             tcp_connections: 0,
             last_stats_update: Instant::now(),
@@ -499,10 +505,9 @@ fn render_cpu_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &AppStat
         app_state.cpu_idle_pct
     )));
 
-    // Frequency ranges (show all clusters)
-    let freq_ranges = get_cpu_freq_ranges();
-    if !freq_ranges.is_empty() {
-        let ranges_str: Vec<String> = freq_ranges
+    // Frequency ranges (show all clusters) - use cached value
+    if !app_state.cpu_freq_ranges.is_empty() {
+        let ranges_str: Vec<String> = app_state.cpu_freq_ranges
             .iter()
             .map(|(min, max)| format!("{}-{} MHz", min, max))
             .collect();
