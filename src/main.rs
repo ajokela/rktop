@@ -905,35 +905,80 @@ fn render_temperature_panel(f: &mut Frame, area: Rect) {
 fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &AppState) {
     // Calculate how many processes will fit (area height - borders - header - bottom margin)
     let available_rows = area.height.saturating_sub(4) as usize; // 2 for borders, 1 for header, 1 for margin
-    let process_count = available_rows.max(1); // At least 1 process
+
+    // Request more processes than available rows to account for threads being grouped
+    // We'll fetch 3x the available rows, assuming on average each process has a few threads
+    let process_count = (available_rows * 3).max(20); // At least 20 processes
 
     let top_processes = get_top_processes(sys, process_count, app_state.process_sort_mode);
 
-    let rows: Vec<Row> = top_processes
-        .iter()
-        .map(|p| {
-            // Format runtime as HH:MM:SS or MM:SS for processes under 1 hour
-            let hours = p.runtime / 3600;
-            let minutes = (p.runtime % 3600) / 60;
-            let seconds = p.runtime % 60;
+    // Organize processes: group threads under their parent process
+    let mut rows: Vec<Row> = Vec::new();
+    let mut seen_processes = std::collections::HashSet::new();
+
+    for p in &top_processes {
+        // Skip threads for now, we'll add them under their parent
+        if p.is_thread {
+            continue;
+        }
+
+        // Skip if we've already added this process
+        if seen_processes.contains(&p.pid) {
+            continue;
+        }
+        seen_processes.insert(p.pid);
+
+        // Add the main process
+        let hours = p.runtime / 3600;
+        let minutes = (p.runtime % 3600) / 60;
+        let seconds = p.runtime % 60;
+        let runtime_str = if hours > 0 {
+            format!("{}:{:02}:{:02}", hours, minutes, seconds)
+        } else {
+            format!("{}:{:02}", minutes, seconds)
+        };
+
+        rows.push(Row::new(vec![
+            p.pid.to_string(),
+            p.user.clone(),
+            format!("{:>3}", p.nice),
+            format!("{}", p.cpu_core),
+            runtime_str,
+            p.name.clone(),
+            format!("{:.1}", p.cpu),
+            format!("{:.1}", p.mem),
+        ]));
+
+        // Now find and add threads for this process
+        let threads: Vec<_> = top_processes.iter()
+            .filter(|t| t.is_thread && t.thread_group_id == p.pid)
+            .collect();
+
+        for (idx, t) in threads.iter().enumerate() {
+            let is_last = idx == threads.len() - 1;
+            let prefix = if is_last { " └─" } else { " ├─" };
+
+            let hours = t.runtime / 3600;
+            let minutes = (t.runtime % 3600) / 60;
+            let seconds = t.runtime % 60;
             let runtime_str = if hours > 0 {
                 format!("{}:{:02}:{:02}", hours, minutes, seconds)
             } else {
                 format!("{}:{:02}", minutes, seconds)
             };
 
-            Row::new(vec![
-                p.pid.to_string(),
-                p.user.clone(),
-                format!("{:>3}", p.nice),
-                format!("{}", p.cpu_core),
+            rows.push(Row::new(vec![
+                format!("{}{}", prefix, t.pid),
+                String::new(), // Empty user for threads
+                format!("{:>3}", t.nice),
+                format!("{}", t.cpu_core),
                 runtime_str,
-                p.name.clone(),
-                format!("{:.1}", p.cpu),
-                format!("{:.1}", p.mem),
-            ])
-        })
-        .collect();
+                format!("{} [thread]", t.name),
+                format!("{:.1}", t.cpu),
+                format!("{:.1}", t.mem),
+            ]));
+        }
+    }
 
     // Highlight the sorted column in the header and show sort direction
     let bold = Style::default().add_modifier(Modifier::BOLD);

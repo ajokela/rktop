@@ -17,6 +17,8 @@ pub struct ProcessInfo {
     pub nice: i32,
     pub runtime: u64, // in seconds
     pub cpu_core: u32, // Which CPU core process is running on
+    pub is_thread: bool, // Is this a thread of another process?
+    pub thread_group_id: u32, // TGID - the main process ID for threads
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +61,9 @@ pub fn get_top_processes(sys: &System, count: usize, sort_mode: ProcessSortMode)
             // Get current CPU core
             let cpu_core = get_process_cpu_core(pid_u32);
 
+            // Get thread information
+            let (thread_group_id, is_thread) = get_thread_info(pid_u32);
+
             ProcessInfo {
                 pid: pid_u32,
                 name,
@@ -68,6 +73,8 @@ pub fn get_top_processes(sys: &System, count: usize, sort_mode: ProcessSortMode)
                 nice,
                 runtime,
                 cpu_core,
+                is_thread,
+                thread_group_id,
             }
         })
         .collect();
@@ -131,6 +138,24 @@ fn get_process_cpu_core(pid: u32) -> u32 {
         }
     }
     0 // Default to core 0
+}
+
+/// Get thread group ID (TGID) for a process
+/// Returns (tgid, is_thread) - if PID != TGID, then this is a thread
+fn get_thread_info(pid: u32) -> (u32, bool) {
+    let status_path = format!("/proc/{}/status", pid);
+    if let Ok(content) = fs::read_to_string(&status_path) {
+        for line in content.lines() {
+            if line.starts_with("Tgid:") {
+                if let Some(tgid_str) = line.split_whitespace().nth(1) {
+                    if let Ok(tgid) = tgid_str.parse::<u32>() {
+                        return (tgid, pid != tgid);
+                    }
+                }
+            }
+        }
+    }
+    (pid, false) // Default: assume it's a main process
 }
 
 fn get_process_user(process: &Process) -> String {
