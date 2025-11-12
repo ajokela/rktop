@@ -2,11 +2,188 @@ use regex::Regex;
 use std::fs;
 use std::path::Path;
 use goblin::Object;
+use crate::file_cache::{read_cached_file, read_cached_u32, read_cached_i32};
 
-/// Read GPU utilization from Mali debugfs
+/// Get total disk space usage across all mounted filesystems
+pub fn get_disk_total() -> Option<(u64, u64)> {
+    // Read /proc/mounts to find mounted filesystems
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+
+    let mut total_size = 0u64;
+    let mut total_used = 0u64;
+
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let mount_point = parts[1];
+        let fs_type = parts[2];
+
+        // Skip virtual filesystems
+        if fs_type == "tmpfs" || fs_type == "devtmpfs" || fs_type == "proc"
+            || fs_type == "sysfs" || fs_type == "devpts" || fs_type == "cgroup"
+            || fs_type == "cgroup2" || fs_type == "securityfs" || fs_type == "debugfs"
+            || fs_type == "tracefs" || fs_type == "pstore" || fs_type == "bpf"
+            || fs_type == "configfs" || fs_type == "hugetlbfs" || fs_type == "mqueue" {
+            continue;
+        }
+
+        // Get statvfs info
+        if let Ok(stat) = nix::sys::statvfs::statvfs(mount_point) {
+            let block_size = stat.block_size() as u64;
+            let total_blocks = stat.blocks() as u64;
+            let free_blocks = stat.blocks_free() as u64;
+
+            total_size += block_size * total_blocks;
+            total_used += block_size * (total_blocks - free_blocks);
+        }
+    }
+
+    if total_size > 0 {
+        Some((total_used, total_size))
+    } else {
+        None
+    }
+}
+
+/// Get list of network adapters, filtering out virtual interfaces
+pub fn get_network_adapters() -> Vec<String> {
+    let mut adapters = Vec::new();
+    let net_dir = "/sys/class/net";
+
+    if let Ok(entries) = fs::read_dir(net_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Filter out virtual/unwanted interfaces
+            if name == "lo" || name.starts_with("dummy") || name.starts_with("veth")
+                || name.starts_with("br-") || name.starts_with("docker") {
+                continue;
+            }
+
+            adapters.push(name);
+        }
+    }
+
+    adapters.sort();
+    adapters
+}
+
+/// Get thermal zone paths (cached at startup to avoid repeated directory scans)
+/// Returns (label, temp_path, type_path) tuples
+pub fn get_thermal_zone_paths() -> Vec<(String, String, String)> {
+    let mut paths = Vec::new();
+    let thermal_dir = "/sys/class/thermal";
+
+    if let Ok(entries) = fs::read_dir(thermal_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name() {
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with("thermal_zone") {
+                    let temp_path = path.join("temp").to_string_lossy().to_string();
+                    let type_path = path.join("type").to_string_lossy().to_string();
+
+                    // Read the type to get the label
+                    if let Ok(type_content) = fs::read_to_string(&type_path) {
+                        let label = type_content.trim().replace("_thermal", "");
+                        paths.push((label, temp_path, type_path));
+                    }
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+/// Read thermal sensors using cached paths (avoids directory scanning)
+pub fn get_thermal_cached(cached_paths: &[(String, String, String)]) -> Vec<(String, i32)> {
+    let mut temps = Vec::new();
+
+    for (label, temp_path, _) in cached_paths {
+        if let Some(temp_millis) = read_cached_i32(temp_path) {
+            let temp_celsius = temp_millis / 1000;
+            temps.push((label.clone(), temp_celsius));
+        }
+    }
+
+    temps
+}
+
+/// Read GPU temperature from hwmon
+pub fn get_gpu_temperature() -> Option<i32> {
+    // Try multiple paths for GPU temperature
+    let paths = [
+        "/sys/class/hwmon/hwmon0/temp1_input",
+        "/sys/class/hwmon/hwmon1/temp1_input",
+        "/sys/class/hwmon/hwmon2/temp1_input",
+        "/sys/class/hwmon/hwmon3/temp1_input",
+    ];
+
+    for path in &paths {
+        // Check if this is a GPU sensor by reading the name
+        let name_path = path.replace("temp1_input", "name");
+        if let Ok(name) = fs::read_to_string(&name_path) {
+            if name.trim().contains("gpu") || name.trim().contains("mali") {
+                if let Some(temp_millis) = read_cached_i32(path) {
+                    return Some(temp_millis / 1000);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Read all hwmon sensors (fans, power, etc.)
+pub fn get_hwmon_sensors() -> Vec<(String, String)> {
+    let mut sensors = Vec::new();
+    let hwmon_dir = "/sys/class/hwmon";
+
+    if let Ok(entries) = fs::read_dir(hwmon_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Read device name
+            let name_path = path.join("name");
+            let device_name = fs::read_to_string(&name_path)
+                .unwrap_or_else(|_| "unknown".to_string())
+                .trim()
+                .to_string();
+
+            // Look for fan speeds
+            for i in 1..=10 {
+                let fan_path = path.join(format!("fan{}_input", i));
+                if let Ok(rpm) = fs::read_to_string(&fan_path) {
+                    if let Ok(rpm_val) = rpm.trim().parse::<u32>() {
+                        sensors.push((format!("{} Fan{}", device_name, i), format!("{} RPM", rpm_val)));
+                    }
+                }
+            }
+
+            // Look for power sensors
+            for i in 1..=10 {
+                let power_path = path.join(format!("power{}_input", i));
+                if let Ok(microwatts) = fs::read_to_string(&power_path) {
+                    if let Ok(uw_val) = microwatts.trim().parse::<u64>() {
+                        let watts = uw_val as f64 / 1_000_000.0;
+                        sensors.push((format!("{} Power{}", device_name, i), format!("{:.2} W", watts)));
+                    }
+                }
+            }
+        }
+    }
+
+    sensors
+}
+
+/// Read GPU utilization from Mali debugfs (using cached file descriptors)
 pub fn get_gpu_usage() -> Option<f32> {
     let path = "/sys/kernel/debug/mali0/dvfs_utilization";
-    if let Ok(content) = fs::read_to_string(path) {
+    if let Ok(content) = read_cached_file(path) {
         // Parse "busy_time: X idle_time: Y" format
         let parts: Vec<&str> = content.split_whitespace().collect();
         let mut busy_time = 0u64;
@@ -32,19 +209,17 @@ pub fn get_gpu_usage() -> Option<f32> {
     None
 }
 
-/// Read CPU frequencies for each core
+/// Read CPU frequencies for each core (using cached file descriptors)
 pub fn get_cpu_frequencies() -> Vec<u32> {
     let mut freqs = Vec::new();
     let mut cpu_id = 0;
 
     loop {
         let path = format!("/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq", cpu_id);
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(freq_khz) = content.trim().parse::<u32>() {
-                freqs.push(freq_khz / 1000); // Convert to MHz
-                cpu_id += 1;
-                continue;
-            }
+        if let Some(freq_khz) = read_cached_u32(&path) {
+            freqs.push(freq_khz / 1000); // Convert to MHz
+            cpu_id += 1;
+            continue;
         }
         break;
     }
@@ -99,21 +274,19 @@ pub fn get_gpu_frequency() -> Option<u32> {
     None
 }
 
-/// Read NPU frequency
+/// Read NPU frequency (using cached file descriptors)
 pub fn get_npu_frequency() -> Option<u32> {
     let path = "/sys/class/devfreq/fdab0000.npu/cur_freq";
-    if let Ok(content) = fs::read_to_string(path) {
-        if let Ok(freq_hz) = content.trim().parse::<u64>() {
-            return Some((freq_hz / 1_000_000) as u32); // Convert to MHz
-        }
-    }
-    None
+    read_cached_file(path)
+        .ok()
+        .and_then(|content| content.trim().parse::<u64>().ok())
+        .map(|freq_hz| (freq_hz / 1_000_000) as u32)
 }
 
-/// Read NPU load percentages for each core
+/// Read NPU load percentages for each core (using cached file descriptors)
 pub fn get_npu_load() -> Vec<u8> {
     let path = "/sys/kernel/debug/rknpu/load";
-    if let Ok(content) = fs::read_to_string(path) {
+    if let Ok(content) = read_cached_file(path) {
         let re = Regex::new(r"Core(\d+):\s*(\d+)%").unwrap();
         let mut loads = Vec::new();
 
@@ -128,11 +301,11 @@ pub fn get_npu_load() -> Vec<u8> {
     Vec::new()
 }
 
-/// Read RGA (Rockchip Graphics Accelerator) load
+/// Read RGA (Rockchip Graphics Accelerator) load (using cached file descriptors)
 /// Returns a map of scheduler names to load percentages
 pub fn get_rga_load() -> Option<Vec<(String, f32)>> {
     let path = "/sys/kernel/debug/rkrga/load";
-    if let Ok(content) = fs::read_to_string(path) {
+    if let Ok(content) = read_cached_file(path) {
         let lines: Vec<&str> = content.lines().collect();
         let mut rga_loads = Vec::new();
         let mut current_scheduler = String::new();

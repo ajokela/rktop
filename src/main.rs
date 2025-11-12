@@ -19,6 +19,7 @@ use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
 
 mod hardware;
 mod sysinfo_ext;
+mod file_cache;
 
 use hardware::*;
 use sysinfo_ext::*;
@@ -33,6 +34,27 @@ pub enum ProcessSortMode {
     PidDesc,
     NameAsc,
     NameDesc,
+}
+
+/// Configurable refresh rates (in seconds)
+#[derive(Debug, Clone)]
+struct RefreshConfig {
+    cpu_memory: u64,    // CPU and memory refresh
+    network_disk: u64,  // Network and disk I/O
+    processes: u64,     // Process list
+    #[allow(dead_code)]
+    stats: u64,         // Governor, TCP connections, etc. (currently unused, for future use)
+}
+
+impl Default for RefreshConfig {
+    fn default() -> Self {
+        Self {
+            cpu_memory: 1,
+            network_disk: 2,
+            processes: 3,
+            stats: 5,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -95,6 +117,10 @@ struct AppState {
     has_rga: bool,
     // Cached CPU frequency ranges (don't change at runtime)
     cpu_freq_ranges: Vec<(u32, u32)>,
+    // Cached network adapters (to avoid scanning /sys/class/net repeatedly)
+    network_adapters: Vec<String>,
+    // Cached thermal zone paths (to avoid directory scanning)
+    thermal_zone_paths: Vec<(String, String, String)>, // (label, temp_path, type_path)
     // Cached stats (updated periodically, not every frame)
     cpu_governor: String,
     tcp_connections: usize,
@@ -138,6 +164,10 @@ impl AppState {
         // Cache CPU frequency ranges (don't change at runtime)
         let cpu_freq_ranges = get_cpu_freq_ranges();
 
+        // Cache network adapters and thermal zones (avoid repeated directory scans)
+        let network_adapters = get_network_adapters();
+        let thermal_zone_paths = get_thermal_zone_paths();
+
         Self {
             prev_disk_read: 0,
             prev_disk_write: 0,
@@ -160,6 +190,8 @@ impl AppState {
             has_npu,
             has_rga,
             cpu_freq_ranges,
+            network_adapters,
+            thermal_zone_paths,
             cpu_governor: String::new(),
             tcp_connections: 0,
             last_stats_update: Instant::now(),
@@ -299,6 +331,11 @@ impl AppState {
         let mut new_adapter_stats = HashMap::new();
 
         for (name, data) in networks.list() {
+            // Skip interfaces not in our cached adapter list (filters out virtual interfaces)
+            if !self.network_adapters.is_empty() && !self.network_adapters.contains(&name.to_string()) {
+                continue;
+            }
+
             let rx = data.total_received();
             let tx = data.total_transmitted();
             total_rx += rx;
@@ -343,11 +380,12 @@ fn run_app(
     last_network_update: &mut Instant,
 ) -> Result<()> {
     let mut last_render = Instant::now();
+    let config = RefreshConfig::default();
 
     loop {
-        // Update system info every second
+        // Update system info based on configured rate
         let mut should_render = false;
-        if last_update.elapsed() >= Duration::from_secs(1) {
+        if last_update.elapsed() >= Duration::from_secs(config.cpu_memory) {
             sys.refresh_cpu_all();
             sys.refresh_memory();
             app_state.update_cpu_stats(); // Update CPU stats (context switches, interrupts)
@@ -356,16 +394,16 @@ fn run_app(
             should_render = true; // Force render after data update
         }
 
-        // Update network stats every 2 seconds (reduces file I/O significantly)
-        if last_network_update.elapsed() >= Duration::from_secs(2) {
+        // Update network stats based on configured rate
+        if last_network_update.elapsed() >= Duration::from_secs(config.network_disk) {
             networks.refresh();
             disks.refresh();
             app_state.update_io_rates(disks, networks);
             *last_network_update = Instant::now();
         }
 
-        // Update processes less frequently (every 3 seconds) to reduce overhead
-        if last_process_update.elapsed() >= Duration::from_secs(3) {
+        // Update processes based on configured rate
+        if last_process_update.elapsed() >= Duration::from_secs(config.processes) {
             sys.refresh_processes(ProcessesToUpdate::All, true);
             *last_process_update = Instant::now();
         }
@@ -377,7 +415,8 @@ fn run_app(
         }
 
         // Handle input with timeout - sleep most of the time to reduce CPU
-        if event::poll(Duration::from_millis(100))? {
+        // Poll every 250ms instead of 100ms to reduce wake-ups
+        if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
@@ -460,7 +499,7 @@ fn ui(f: &mut Frame, sys: &System, app_state: &AppState) {
         .split(bottom_chunks[0]);
 
     render_io_panel(f, bottom_left_chunks[0], app_state);
-    render_temperature_panel(f, bottom_left_chunks[1]);
+    render_temperature_panel(f, bottom_left_chunks[1], app_state);
 
     // Bottom right: Process table and help text
     let process_chunks = Layout::default()
@@ -475,6 +514,9 @@ fn ui(f: &mut Frame, sys: &System, app_state: &AppState) {
 fn render_cpu_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &AppState) {
     let cpus = sys.cpus();
     let cpu_freqs = get_cpu_frequencies();
+
+    // Calculate total CPU usage across all cores
+    let total_cpu_usage: f32 = cpus.iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
     let mut cpu_info: Vec<Line> = cpus
         .iter()
@@ -492,6 +534,9 @@ fn render_cpu_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &AppStat
             ])
         })
         .collect();
+
+    // Add total CPU usage line
+    cpu_info.insert(0, Line::from(format!("Total CPU: {:.1}%", total_cpu_usage)));
 
     // Add blank line
     cpu_info.push(Line::from(""));
@@ -687,28 +732,46 @@ fn render_right_panels(f: &mut Frame, area: Rect, app_state: &AppState, sys: &Sy
 
 fn render_system_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     // Use cached values instead of calling expensive functions every frame
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Board: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(&app_state.board_name, Style::default().add_modifier(Modifier::ITALIC)),
-        ]),
-        Line::from(vec![
-            Span::styled("SoC: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(&app_state.rk_model, Style::default().add_modifier(Modifier::ITALIC)),
-        ]),
-        Line::from(format!("NPU Driver:    {}", app_state.npu_version)),
-        Line::from(format!("RGA Driver:    {}", app_state.rga_version)),
-        Line::from(format!("RKNN Runtime:  {}", app_state.rknn_version)),
-        Line::from(format!("RKLLM Runtime: {}", app_state.rkllm_version)),
+
+    // Read hostname and kernel for right column
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|k| k.trim().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    // Build table with two columns
+    let row_data = vec![
+        (format!("Board: {}", app_state.board_name), format!("Host: {}", hostname)),
+        (format!("SoC: {}", app_state.rk_model), format!("Kernel: {}", kernel)),
+        (format!("NPU Driver:    {}", app_state.npu_version), String::new()),
+        (format!("RGA Driver:    {}", app_state.rga_version), String::new()),
+        (format!("RKNN Runtime:  {}", app_state.rknn_version), String::new()),
+        (format!("RKLLM Runtime: {}", app_state.rkllm_version), String::new()),
     ];
 
-    let block = Block::default()
-        .title("SYS")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red));
+    let rows: Vec<Row> = row_data
+        .iter()
+        .map(|(left, right)| Row::new(vec![left.as_str(), right.as_str()]))
+        .collect();
 
-    let paragraph = Paragraph::new(lines).block(block);
-    f.render_widget(paragraph, area);
+    let table = Table::new(
+        rows,
+        [Constraint::Percentage(50), Constraint::Percentage(50)],
+    )
+    .block(
+        Block::default()
+            .title("SYS")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red)),
+    )
+    .column_spacing(1);
+
+    f.render_widget(table, area);
 }
 
 fn render_gpu_panel(f: &mut Frame, area: Rect) {
@@ -842,6 +905,25 @@ fn render_io_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
         ("Net TX (Tot)".to_string(), format!("{}/s", human_bytes_f64(app_state.net_tx_rate))),
     ];
 
+    // Boot time
+    if let Ok(uptime_content) = std::fs::read_to_string("/proc/uptime") {
+        if let Some(uptime_str) = uptime_content.split_whitespace().next() {
+            if let Ok(uptime_secs) = uptime_str.parse::<f64>() {
+                let days = (uptime_secs / 86400.0) as u64;
+                let hours = ((uptime_secs % 86400.0) / 3600.0) as u64;
+                let mins = ((uptime_secs % 3600.0) / 60.0) as u64;
+                row_data.push(("Boot time".to_string(), format!("{}d {}h {}m ago", days, hours, mins)));
+            }
+        }
+    }
+
+    // Disk space summary
+    if let Some((used, total)) = get_disk_total() {
+        let percent = (used as f64 / total as f64 * 100.0) as u32;
+        row_data.push(("Disk Space".to_string(), format!("{} / {} ({}%)",
+            human_bytes(used), human_bytes(total), percent)));
+    }
+
     // Add individual network adapters
     let mut adapters: Vec<_> = app_state.adapter_rates.iter().collect();
     adapters.sort_by(|a, b| a.0.cmp(b.0)); // Sort by adapter name
@@ -879,14 +961,29 @@ fn render_io_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     f.render_widget(table, area);
 }
 
-fn render_temperature_panel(f: &mut Frame, area: Rect) {
-    let temps = get_thermal();
+fn render_temperature_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
+    let mut row_data = Vec::new();
 
-    let temp_strings: Vec<String> = temps.iter().map(|(_, t)| format!("{}°C", t)).collect();
-    let rows: Vec<Row> = temps
+    // Add thermal zone temperatures
+    let temps = get_thermal_cached(&app_state.thermal_zone_paths);
+    for (name, temp) in temps {
+        row_data.push((name, format!("{}°C", temp)));
+    }
+
+    // Add GPU temperature if available
+    if let Some(gpu_temp) = get_gpu_temperature() {
+        row_data.push(("GPU".to_string(), format!("{}°C", gpu_temp)));
+    }
+
+    // Add hwmon sensors (fans, power)
+    let hwmon = get_hwmon_sensors();
+    for (sensor_name, value) in hwmon {
+        row_data.push((sensor_name, value));
+    }
+
+    let rows: Vec<Row> = row_data
         .iter()
-        .enumerate()
-        .map(|(i, (name, _))| Row::new(vec![name.as_str(), temp_strings[i].as_str()]))
+        .map(|(name, value)| Row::new(vec![name.as_str(), value.as_str()]))
         .collect();
 
     let table = Table::new(rows, [Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -1023,7 +1120,7 @@ fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &App
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),   // PID
+            Constraint::Length(11),  // PID (wider to accommodate thread prefixes " └─12345")
             Constraint::Length(10),  // User
             Constraint::Length(4),   // Nice
             Constraint::Length(2),   // CPU core
