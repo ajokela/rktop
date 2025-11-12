@@ -51,7 +51,7 @@ impl Default for RefreshConfig {
         Self {
             cpu_memory: 1,
             network_disk: 2,
-            processes: 3,
+            processes: 2,     // Keep responsive at 2 seconds
             stats: 5,
         }
     }
@@ -107,6 +107,7 @@ struct AppState {
     // Cached static info
     board_name: String,
     rk_model: String,
+    cpu_arch: String,
     npu_version: String,
     rga_version: String,
     rknn_version: String,
@@ -151,6 +152,7 @@ impl AppState {
         // Cache all static system info at startup (expensive operations)
         let board_name = get_board_name();
         let rk_model = get_rk_model();
+        let cpu_arch = get_cpu_architecture();
         let npu_version = get_npu_driver_version();
         let rga_version = get_rga_version();
         let rknn_version = get_librknnrt_version();
@@ -182,6 +184,7 @@ impl AppState {
             adapter_rates: HashMap::new(),
             board_name,
             rk_model,
+            cpu_arch,
             npu_version,
             rga_version,
             rknn_version,
@@ -403,8 +406,10 @@ fn run_app(
         }
 
         // Update processes based on configured rate
+        // Use false for the second parameter to limit depth of process info refresh
+        // This reduces syscalls by not reading all details for every process
         if last_process_update.elapsed() >= Duration::from_secs(config.processes) {
-            sys.refresh_processes(ProcessesToUpdate::All, true);
+            sys.refresh_processes(ProcessesToUpdate::All, false);
             *last_process_update = Instant::now();
         }
 
@@ -748,7 +753,7 @@ fn render_system_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     let row_data = vec![
         (format!("Board: {}", app_state.board_name), format!("Host: {}", hostname)),
         (format!("SoC: {}", app_state.rk_model), format!("Kernel: {}", kernel)),
-        (format!("NPU Driver:    {}", app_state.npu_version), String::new()),
+        (format!("NPU Driver:    {}", app_state.npu_version), format!("Arch: {}", app_state.cpu_arch)),
         (format!("RGA Driver:    {}", app_state.rga_version), String::new()),
         (format!("RKNN Runtime:  {}", app_state.rknn_version), String::new()),
         (format!("RKLLM Runtime: {}", app_state.rkllm_version), String::new()),
@@ -905,18 +910,6 @@ fn render_io_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
         ("Net TX (Tot)".to_string(), format!("{}/s", human_bytes_f64(app_state.net_tx_rate))),
     ];
 
-    // Boot time
-    if let Ok(uptime_content) = std::fs::read_to_string("/proc/uptime") {
-        if let Some(uptime_str) = uptime_content.split_whitespace().next() {
-            if let Ok(uptime_secs) = uptime_str.parse::<f64>() {
-                let days = (uptime_secs / 86400.0) as u64;
-                let hours = ((uptime_secs % 86400.0) / 3600.0) as u64;
-                let mins = ((uptime_secs % 3600.0) / 60.0) as u64;
-                row_data.push(("Boot time".to_string(), format!("{}d {}h {}m ago", days, hours, mins)));
-            }
-        }
-    }
-
     // Disk space summary
     if let Some((used, total)) = get_disk_total() {
         let percent = (used as f64 / total as f64 * 100.0) as u32;
@@ -1038,8 +1031,10 @@ fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &App
         rows.push(Row::new(vec![
             p.pid.to_string(),
             p.user.clone(),
+            format!("{}", p.state),
             format!("{:>3}", p.nice),
             format!("{}", p.cpu_core),
+            format!("{}", p.num_threads),
             runtime_str,
             p.name.clone(),
             format!("{:.1}", p.cpu),
@@ -1067,8 +1062,10 @@ fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &App
             rows.push(Row::new(vec![
                 format!("{}{}", prefix, t.pid),
                 String::new(), // Empty user for threads
+                format!("{}", t.state),
                 format!("{:>3}", t.nice),
                 format!("{}", t.cpu_core),
+                String::new(), // Empty threads count for threads
                 runtime_str,
                 format!("{} [thread]", t.name),
                 format!("{:.1}", t.cpu),
@@ -1108,8 +1105,10 @@ fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &App
     let header = Row::new(vec![
         Span::styled(pid_text, pid_style),
         Span::styled("User", bold),
+        Span::styled("S", bold),         // State
         Span::styled("NI", bold),
         Span::styled("C", bold),
+        Span::styled("THR", bold),       // Threads
         Span::styled("Time", bold),
         Span::styled(name_text, name_style),
         Span::styled(cpu_text, cpu_style),
@@ -1122,10 +1121,12 @@ fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &App
         [
             Constraint::Length(11),  // PID (wider to accommodate thread prefixes " └─12345")
             Constraint::Length(10),  // User
+            Constraint::Length(2),   // State
             Constraint::Length(4),   // Nice
             Constraint::Length(2),   // CPU core
+            Constraint::Length(4),   // Threads
             Constraint::Length(9),   // Runtime
-            Constraint::Percentage(45), // Name (reduced further)
+            Constraint::Percentage(45), // Name (more space without FDs column)
             Constraint::Length(6),   // CPU%
             Constraint::Length(6),   // Mem%
         ],

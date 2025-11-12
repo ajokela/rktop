@@ -386,6 +386,74 @@ pub fn get_rk_model() -> String {
     "Unknown RK".to_string()
 }
 
+/// Get CPU architecture information
+pub fn get_cpu_architecture() -> String {
+    // Try to read from /proc/cpuinfo
+    if let Ok(content) = fs::read_to_string("/proc/cpuinfo") {
+        let mut arch = None;
+        let mut parts = std::collections::HashSet::new();
+
+        for line in content.lines() {
+            if line.starts_with("CPU architecture:") {
+                arch = line.split(':').nth(1).map(|s| s.trim().to_string());
+            } else if line.starts_with("CPU part") {
+                if let Some(part) = line.split(':').nth(1).map(|s| s.trim().to_string()) {
+                    parts.insert(part);
+                }
+            }
+        }
+
+        // Build architecture string
+        if let Some(arch_val) = arch {
+            let mut result = format!("ARMv{}", arch_val);
+
+            // Collect all core types found
+            let mut core_names = Vec::new();
+            for part_val in &parts {
+                let core_name = match part_val.as_str() {
+                    "0xd03" => Some("A53"),
+                    "0xd04" => Some("A35"),
+                    "0xd05" => Some("A55"),
+                    "0xd07" => Some("A57"),
+                    "0xd08" => Some("A72"),
+                    "0xd09" => Some("A73"),
+                    "0xd0a" => Some("A75"),
+                    "0xd0b" => Some("A76"),
+                    "0xd0d" => Some("A77"),
+                    "0xd40" => Some("N1"),
+                    "0xd41" => Some("A78"),
+                    "0xd44" => Some("X1"),
+                    "0xd46" => Some("A510"),
+                    "0xd47" => Some("A710"),
+                    "0xd48" => Some("X2"),
+                    "0xd4d" => Some("A715"),
+                    _ => None,
+                };
+                if let Some(name) = core_name {
+                    core_names.push(name);
+                }
+            }
+
+            // Sort and add to result
+            if !core_names.is_empty() {
+                core_names.sort();
+                result.push_str(&format!(" ({})", core_names.join("+")));
+            }
+
+            return result;
+        }
+    }
+
+    // Fallback to uname
+    if let Ok(output) = std::process::Command::new("uname").arg("-m").output() {
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+    }
+
+    "Unknown".to_string()
+}
+
 /// Read RGA driver version
 pub fn get_rga_version() -> String {
     let path = "/sys/kernel/debug/rkrga/driver_version";
@@ -462,88 +530,4 @@ pub fn get_librknnrt_version() -> String {
 /// Read librkllmrt library version
 pub fn get_librkllmrt_version() -> String {
     extract_version_from_binary("/usr/lib/librkllmrt.so", "RKLLM SDK (version:")
-}
-
-/// Read temperature sensors from both thermal_zone and hwmon
-pub fn get_thermal() -> Vec<(String, i32)> {
-    let mut temps = Vec::new();
-
-    // Read from thermal_zone (SoC temperatures)
-    let thermal_dir = "/sys/class/thermal";
-    if let Ok(entries) = fs::read_dir(thermal_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name() {
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("thermal_zone") {
-                    let temp_path = path.join("temp");
-                    let type_path = path.join("type");
-
-                    if let (Ok(temp_content), Ok(type_content)) =
-                        (fs::read_to_string(&temp_path), fs::read_to_string(&type_path))
-                    {
-                        if let Ok(temp_millis) = temp_content.trim().parse::<i32>() {
-                            let temp_celsius = temp_millis / 1000;
-                            let label = type_content.trim().replace("_thermal", "");
-                            temps.push((label, temp_celsius));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Read from hwmon (NVMe, fan controllers, etc.)
-    // Skip hwmon devices that are duplicates of thermal zones (they end with "_thermal")
-    let hwmon_dir = "/sys/class/hwmon";
-    if let Ok(entries) = fs::read_dir(hwmon_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name_path = path.join("name");
-
-            // Read the device name
-            if let Ok(device_name) = fs::read_to_string(&name_path) {
-                let device_name = device_name.trim().to_string();
-
-                // Skip thermal zone duplicates (they're already read above)
-                if device_name.ends_with("_thermal") {
-                    continue;
-                }
-
-                // Look for temp inputs in this hwmon device
-                if let Ok(hwmon_entries) = fs::read_dir(&path) {
-                    for hwmon_entry in hwmon_entries.flatten() {
-                        let hwmon_file = hwmon_entry.path();
-                        if let Some(filename) = hwmon_file.file_name() {
-                            let filename_str = filename.to_string_lossy();
-
-                            // Match temp*_input files
-                            if filename_str.starts_with("temp") && filename_str.ends_with("_input") {
-                                // Try to read the corresponding label
-                                let label_file = filename_str.replace("_input", "_label");
-                                let label_path = path.join(&label_file);
-
-                                let label = if let Ok(label_content) = fs::read_to_string(&label_path) {
-                                    label_content.trim().to_string()
-                                } else {
-                                    // Use device name if no label available
-                                    device_name.clone()
-                                };
-
-                                // Read the temperature
-                                if let Ok(temp_content) = fs::read_to_string(&hwmon_file) {
-                                    if let Ok(temp_millis) = temp_content.trim().parse::<i32>() {
-                                        let temp_celsius = temp_millis / 1000;
-                                        temps.push((label, temp_celsius));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    temps
 }

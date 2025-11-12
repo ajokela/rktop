@@ -19,6 +19,8 @@ pub struct ProcessInfo {
     pub cpu_core: u32, // Which CPU core process is running on
     pub is_thread: bool, // Is this a thread of another process?
     pub thread_group_id: u32, // TGID - the main process ID for threads
+    pub state: char, // Process state: R, S, D, Z, T, etc.
+    pub num_threads: u32, // Number of threads in this process
 }
 
 #[derive(Debug, Clone)]
@@ -42,27 +44,68 @@ impl ZramInfo {
 
 /// Get top processes with configurable sorting
 pub fn get_top_processes(sys: &System, count: usize, sort_mode: ProcessSortMode) -> Vec<ProcessInfo> {
-    let mut processes: Vec<ProcessInfo> = sys
+    // First pass: collect minimal info and sort
+    let mut minimal_processes: Vec<_> = sys
         .processes()
         .iter()
         .map(|(pid, process)| {
-            let pid_u32 = pid.as_u32();
+            (
+                pid.as_u32(),
+                process,
+                process.cpu_usage(),
+                process.memory() as f32 / sys.total_memory() as f32 * 100.0,
+            )
+        })
+        .collect();
+
+    // Sort the minimal list based on selected mode
+    match sort_mode {
+        ProcessSortMode::CpuDesc => {
+            minimal_processes.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        }
+        ProcessSortMode::CpuAsc => {
+            minimal_processes.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        }
+        ProcessSortMode::MemoryDesc => {
+            minimal_processes.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+        }
+        ProcessSortMode::MemoryAsc => {
+            minimal_processes.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
+        }
+        ProcessSortMode::PidAsc => {
+            minimal_processes.sort_by_key(|p| p.0);
+        }
+        ProcessSortMode::PidDesc => {
+            minimal_processes.sort_by(|a, b| b.0.cmp(&a.0));
+        }
+        ProcessSortMode::NameAsc => {
+            minimal_processes.sort_by(|a, b| {
+                a.1.name().to_string_lossy().to_lowercase()
+                    .cmp(&b.1.name().to_string_lossy().to_lowercase())
+            });
+        }
+        ProcessSortMode::NameDesc => {
+            minimal_processes.sort_by(|a, b| {
+                b.1.name().to_string_lossy().to_lowercase()
+                    .cmp(&a.1.name().to_string_lossy().to_lowercase())
+            });
+        }
+    }
+
+    // Second pass: only read detailed info for top N processes
+    minimal_processes
+        .into_iter()
+        .take(count)
+        .map(|(pid_u32, process, cpu, mem)| {
             let name = process.name().to_string_lossy().to_string();
             let user = get_process_user(process);
-            let cpu = process.cpu_usage();
-            let mem = process.memory() as f32 / sys.total_memory() as f32 * 100.0;
-
-            // Get nice level (priority) - default to 0 if not available
-            let nice = get_process_nice(pid_u32);
-
-            // Get runtime in seconds
             let runtime = process.run_time();
 
-            // Get current CPU core
+            // Only read extended info for top N processes
+            let nice = get_process_nice(pid_u32);
             let cpu_core = get_process_cpu_core(pid_u32);
-
-            // Get thread information
-            let (thread_group_id, is_thread) = get_thread_info(pid_u32);
+            let (thread_group_id, is_thread, num_threads, state, _num_fds) =
+                get_process_extended_info(pid_u32);
 
             ProcessInfo {
                 pid: pid_u32,
@@ -75,39 +118,11 @@ pub fn get_top_processes(sys: &System, count: usize, sort_mode: ProcessSortMode)
                 cpu_core,
                 is_thread,
                 thread_group_id,
+                state,
+                num_threads,
             }
         })
-        .collect();
-
-    // Sort based on selected mode
-    match sort_mode {
-        ProcessSortMode::CpuDesc => {
-            processes.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap());
-        }
-        ProcessSortMode::CpuAsc => {
-            processes.sort_by(|a, b| a.cpu.partial_cmp(&b.cpu).unwrap());
-        }
-        ProcessSortMode::MemoryDesc => {
-            processes.sort_by(|a, b| b.mem.partial_cmp(&a.mem).unwrap());
-        }
-        ProcessSortMode::MemoryAsc => {
-            processes.sort_by(|a, b| a.mem.partial_cmp(&b.mem).unwrap());
-        }
-        ProcessSortMode::PidAsc => {
-            processes.sort_by_key(|p| p.pid);
-        }
-        ProcessSortMode::PidDesc => {
-            processes.sort_by(|a, b| b.pid.cmp(&a.pid));
-        }
-        ProcessSortMode::NameAsc => {
-            processes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        }
-        ProcessSortMode::NameDesc => {
-            processes.sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
-        }
-    }
-
-    processes.into_iter().take(count).collect()
+        .collect()
 }
 
 fn get_process_nice(pid: u32) -> i32 {
@@ -140,22 +155,54 @@ fn get_process_cpu_core(pid: u32) -> u32 {
     0 // Default to core 0
 }
 
-/// Get thread group ID (TGID) for a process
-/// Returns (tgid, is_thread) - if PID != TGID, then this is a thread
-fn get_thread_info(pid: u32) -> (u32, bool) {
+/// Get consolidated process info from /proc/[pid]/status and /proc/[pid]/stat
+/// Returns (tgid, is_thread, num_threads, state, num_fds)
+/// This reads files once instead of multiple times
+fn get_process_extended_info(pid: u32) -> (u32, bool, u32, char, u32) {
+    let mut tgid = pid;
+    let mut num_threads = 1;
+    let mut state = 'U';
+
+    // Read /proc/[pid]/status once for TGID and thread count
     let status_path = format!("/proc/{}/status", pid);
     if let Ok(content) = fs::read_to_string(&status_path) {
         for line in content.lines() {
             if line.starts_with("Tgid:") {
                 if let Some(tgid_str) = line.split_whitespace().nth(1) {
-                    if let Ok(tgid) = tgid_str.parse::<u32>() {
-                        return (tgid, pid != tgid);
+                    if let Ok(parsed_tgid) = tgid_str.parse::<u32>() {
+                        tgid = parsed_tgid;
+                    }
+                }
+            } else if line.starts_with("Threads:") {
+                if let Some(threads_str) = line.split_whitespace().nth(1) {
+                    if let Ok(threads) = threads_str.parse::<u32>() {
+                        num_threads = threads;
                     }
                 }
             }
         }
     }
-    (pid, false) // Default: assume it's a main process
+
+    let is_thread = pid != tgid;
+
+    // Read /proc/[pid]/stat once for state
+    let stat_path = format!("/proc/{}/stat", pid);
+    if let Ok(content) = fs::read_to_string(&stat_path) {
+        // State is the field after the command name (which is in parentheses)
+        if let Some(paren_end) = content.rfind(')') {
+            let after_name = &content[paren_end + 1..];
+            if let Some(state_char) = after_name.trim().chars().next() {
+                state = state_char;
+            }
+        }
+    }
+
+    // Skip file descriptor counting entirely - it's very expensive
+    // Counting FDs requires opening and iterating /proc/[pid]/fd directory
+    // For a system with 200+ processes, this adds significant overhead
+    let num_fds = 0;
+
+    (tgid, is_thread, num_threads, state, num_fds)
 }
 
 fn get_process_user(process: &Process) -> String {
