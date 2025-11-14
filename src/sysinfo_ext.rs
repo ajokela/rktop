@@ -221,16 +221,19 @@ fn get_process_user(process: &Process) -> String {
                 return username.clone();
             }
 
-            // Not in cache, look it up once and cache it
-            if let Ok(output) = std::process::Command::new("id")
-                .arg("-nu")
-                .arg(uid.to_string())
-                .output()
-            {
-                if output.status.success() {
-                    let username = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    map.insert(uid_num, username.clone());
-                    return username;
+            // Not in cache, read from /etc/passwd (faster than spawning 'id' command)
+            if let Ok(passwd_content) = fs::read_to_string("/etc/passwd") {
+                for line in passwd_content.lines() {
+                    let parts: Vec<&str> = line.split(':').collect();
+                    if parts.len() >= 3 {
+                        if let Ok(line_uid) = parts[2].parse::<u32>() {
+                            if line_uid == uid_num {
+                                let username = parts[0].to_string();
+                                map.insert(uid_num, username.clone());
+                                return username;
+                            }
+                        }
+                    }
                 }
             }
 

@@ -145,6 +145,13 @@ struct AppState {
     // Process counts
     running_procs: u64,
     blocked_procs: u64,
+    // Historical data for sparklines (last 60 samples at 1 second each)
+    cpu_history: Vec<f32>,
+    gpu_history: Vec<f32>,
+    npu_history: Vec<f32>,
+    // Process filtering
+    filter_text: String,
+    filter_mode: bool, // true when actively editing filter
 }
 
 impl AppState {
@@ -213,6 +220,39 @@ impl AppState {
             prev_cpu_time: CpuStats::default(),
             running_procs: 0,
             blocked_procs: 0,
+            cpu_history: Vec::new(),
+            gpu_history: Vec::new(),
+            npu_history: Vec::new(),
+            filter_text: String::new(),
+            filter_mode: false,
+        }
+    }
+
+    fn update_history(&mut self, total_cpu: f32) {
+        const MAX_HISTORY: usize = 60; // Keep 60 seconds of history
+
+        // Update CPU history
+        self.cpu_history.push(total_cpu);
+        if self.cpu_history.len() > MAX_HISTORY {
+            self.cpu_history.remove(0);
+        }
+
+        // Update GPU history
+        if let Some(gpu_usage) = get_gpu_usage() {
+            self.gpu_history.push(gpu_usage);
+            if self.gpu_history.len() > MAX_HISTORY {
+                self.gpu_history.remove(0);
+            }
+        }
+
+        // Update NPU history (average across cores)
+        let npu_loads = get_npu_load();
+        if !npu_loads.is_empty() {
+            let avg_npu: f32 = npu_loads.iter().map(|&x| x as f32).sum::<f32>() / npu_loads.len() as f32;
+            self.npu_history.push(avg_npu);
+            if self.npu_history.len() > MAX_HISTORY {
+                self.npu_history.remove(0);
+            }
         }
     }
 
@@ -393,6 +433,11 @@ fn run_app(
             sys.refresh_memory();
             app_state.update_cpu_stats(); // Update CPU stats (context switches, interrupts)
             app_state.update_stats(); // Update governor and TCP connections (throttled internally)
+
+            // Calculate total CPU usage for history (100% - idle%)
+            let total_cpu = 100.0 - app_state.cpu_idle_pct as f32;
+            app_state.update_history(total_cpu);
+
             *last_update = Instant::now();
             should_render = true; // Force render after data update
         }
@@ -406,10 +451,10 @@ fn run_app(
         }
 
         // Update processes based on configured rate
-        // Use false for the second parameter to limit depth of process info refresh
-        // This reduces syscalls by not reading all details for every process
+        // Refresh with shallow read to limit syscalls, but remove dead processes
         if last_process_update.elapsed() >= Duration::from_secs(config.processes) {
-            sys.refresh_processes(ProcessesToUpdate::All, false);
+            // Remove processes that no longer exist
+            sys.refresh_processes(ProcessesToUpdate::All, true);
             *last_process_update = Instant::now();
         }
 
@@ -424,39 +469,68 @@ fn run_app(
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                            return Ok(());
+                    // Handle filter mode input separately
+                    if app_state.filter_mode {
+                        match key.code {
+                            KeyCode::Char(c) => {
+                                app_state.filter_text.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                app_state.filter_text.pop();
+                            }
+                            KeyCode::Esc => {
+                                app_state.filter_mode = false;
+                                app_state.filter_text.clear();
+                            }
+                            KeyCode::Enter => {
+                                app_state.filter_mode = false;
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('c') | KeyCode::Char('C') => {
-                            app_state.process_sort_mode = match app_state.process_sort_mode {
-                                ProcessSortMode::CpuDesc => ProcessSortMode::CpuAsc,
-                                ProcessSortMode::CpuAsc => ProcessSortMode::CpuDesc,
-                                _ => ProcessSortMode::CpuDesc,
-                            };
+                    } else {
+                        // Normal mode keyboard shortcuts
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                return Ok(());
+                            }
+                            KeyCode::Char('/') => {
+                                app_state.filter_mode = true;
+                                app_state.filter_text.clear();
+                            }
+                            KeyCode::Esc => {
+                                // Clear filter when ESC pressed in normal mode
+                                app_state.filter_text.clear();
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                app_state.process_sort_mode = match app_state.process_sort_mode {
+                                    ProcessSortMode::CpuDesc => ProcessSortMode::CpuAsc,
+                                    ProcessSortMode::CpuAsc => ProcessSortMode::CpuDesc,
+                                    _ => ProcessSortMode::CpuDesc,
+                                };
+                            }
+                            KeyCode::Char('m') | KeyCode::Char('M') => {
+                                app_state.process_sort_mode = match app_state.process_sort_mode {
+                                    ProcessSortMode::MemoryDesc => ProcessSortMode::MemoryAsc,
+                                    ProcessSortMode::MemoryAsc => ProcessSortMode::MemoryDesc,
+                                    _ => ProcessSortMode::MemoryDesc,
+                                };
+                            }
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                                app_state.process_sort_mode = match app_state.process_sort_mode {
+                                    ProcessSortMode::PidAsc => ProcessSortMode::PidDesc,
+                                    ProcessSortMode::PidDesc => ProcessSortMode::PidAsc,
+                                    _ => ProcessSortMode::PidAsc,
+                                };
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                app_state.process_sort_mode = match app_state.process_sort_mode {
+                                    ProcessSortMode::NameAsc => ProcessSortMode::NameDesc,
+                                    ProcessSortMode::NameDesc => ProcessSortMode::NameAsc,
+                                    _ => ProcessSortMode::NameAsc,
+                                };
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('m') | KeyCode::Char('M') => {
-                            app_state.process_sort_mode = match app_state.process_sort_mode {
-                                ProcessSortMode::MemoryDesc => ProcessSortMode::MemoryAsc,
-                                ProcessSortMode::MemoryAsc => ProcessSortMode::MemoryDesc,
-                                _ => ProcessSortMode::MemoryDesc,
-                            };
-                        }
-                        KeyCode::Char('p') | KeyCode::Char('P') => {
-                            app_state.process_sort_mode = match app_state.process_sort_mode {
-                                ProcessSortMode::PidAsc => ProcessSortMode::PidDesc,
-                                ProcessSortMode::PidDesc => ProcessSortMode::PidAsc,
-                                _ => ProcessSortMode::PidAsc,
-                            };
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
-                            app_state.process_sort_mode = match app_state.process_sort_mode {
-                                ProcessSortMode::NameAsc => ProcessSortMode::NameDesc,
-                                ProcessSortMode::NameDesc => ProcessSortMode::NameAsc,
-                                _ => ProcessSortMode::NameAsc,
-                            };
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -516,6 +590,28 @@ fn ui(f: &mut Frame, sys: &System, app_state: &AppState) {
     render_help_text(f, process_chunks[1], app_state);
 }
 
+/// Render a sparkline from historical data
+/// Uses block characters to create a mini-chart: ▁▂▃▄▅▆▇█
+fn render_sparkline(data: &[f32], max_value: f32) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+
+    let blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    data.iter()
+        .map(|&value| {
+            let normalized = if max_value > 0.0 {
+                (value / max_value).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let index = ((normalized * (blocks.len() - 1) as f32).round() as usize).min(blocks.len() - 1);
+            blocks[index]
+        })
+        .collect()
+}
+
 fn render_cpu_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &AppState) {
     let cpus = sys.cpus();
     let cpu_freqs = get_cpu_frequencies();
@@ -540,8 +636,17 @@ fn render_cpu_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &AppStat
         })
         .collect();
 
-    // Add total CPU usage line
+    // Add total CPU usage line with sparkline
     cpu_info.insert(0, Line::from(format!("Total CPU: {:.1}%", total_cpu_usage)));
+
+    // Add sparkline if we have history
+    if !app_state.cpu_history.is_empty() {
+        let sparkline = render_sparkline(&app_state.cpu_history, 100.0);
+        cpu_info.insert(1, Line::from(vec![
+            Span::raw("History:   "),
+            Span::styled(sparkline, Style::default().fg(Color::Cyan)),
+        ]));
+    }
 
     // Add blank line
     cpu_info.push(Line::from(""));
@@ -689,10 +794,10 @@ fn render_right_panels(f: &mut Frame, area: Rect, app_state: &AppState, sys: &Sy
 
     // Use cached hardware availability instead of checking every frame
     if app_state.has_gpu {
-        constraints.push(Constraint::Length(5));
+        constraints.push(Constraint::Length(6)); // Increased for sparkline
     }
     if app_state.has_npu {
-        constraints.push(Constraint::Length(5));
+        constraints.push(Constraint::Length(7)); // Increased for sparkline
     }
     if app_state.has_rga {
         constraints.push(Constraint::Length(5));
@@ -715,13 +820,13 @@ fn render_right_panels(f: &mut Frame, area: Rect, app_state: &AppState, sys: &Sy
 
     // GPU
     if app_state.has_gpu {
-        render_gpu_panel(f, chunks[chunk_idx]);
+        render_gpu_panel(f, chunks[chunk_idx], app_state);
         chunk_idx += 1;
     }
 
     // NPU
     if app_state.has_npu {
-        render_npu_panel(f, chunks[chunk_idx]);
+        render_npu_panel(f, chunks[chunk_idx], app_state);
         chunk_idx += 1;
     }
 
@@ -779,7 +884,7 @@ fn render_system_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     f.render_widget(table, area);
 }
 
-fn render_gpu_panel(f: &mut Frame, area: Rect) {
+fn render_gpu_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     if let Some(usage) = get_gpu_usage() {
         let freq = get_gpu_frequency();
         let freq_str = freq.map(|f| format!(" {} MHz", f)).unwrap_or_default();
@@ -788,23 +893,32 @@ fn render_gpu_panel(f: &mut Frame, area: Rect) {
         let filled = ((usage / 100.0) * bar_width as f32) as usize;
         let bar = "█".repeat(filled) + &"░".repeat(bar_width - filled);
 
-        let line = Line::from(vec![
+        let mut lines = vec![Line::from(vec![
             Span::raw("Mali0 "),
             Span::styled(bar, Style::default().fg(Color::Green)),
             Span::raw(format!(" {:>5.2}%{}", usage, freq_str)),
-        ]);
+        ])];
+
+        // Add sparkline if we have history
+        if !app_state.gpu_history.is_empty() {
+            let sparkline = render_sparkline(&app_state.gpu_history, 100.0);
+            lines.push(Line::from(vec![
+                Span::raw("History: "),
+                Span::styled(sparkline, Style::default().fg(Color::Green)),
+            ]));
+        }
 
         let block = Block::default()
             .title("GPU")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green));
 
-        let paragraph = Paragraph::new(vec![line]).block(block);
+        let paragraph = Paragraph::new(lines).block(block);
         f.render_widget(paragraph, area);
     }
 }
 
-fn render_npu_panel(f: &mut Frame, area: Rect) {
+fn render_npu_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     let loads = get_npu_load();
     if loads.is_empty() {
         return;
@@ -813,7 +927,7 @@ fn render_npu_panel(f: &mut Frame, area: Rect) {
     let freq = get_npu_frequency();
     let freq_str = freq.map(|f| format!(" {} MHz", f)).unwrap_or_default();
 
-    let lines: Vec<Line> = loads
+    let mut lines: Vec<Line> = loads
         .iter()
         .enumerate()
         .map(|(i, &load)| {
@@ -827,6 +941,16 @@ fn render_npu_panel(f: &mut Frame, area: Rect) {
             ])
         })
         .collect();
+
+    // Add sparkline if we have history (showing average across all cores)
+    if !app_state.npu_history.is_empty() {
+        let sparkline = render_sparkline(&app_state.npu_history, 100.0);
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::raw("History: "),
+            Span::styled(sparkline, Style::default().fg(Color::Green)),
+        ]));
+    }
 
     let block = Block::default()
         .title("NPU")
@@ -1002,11 +1126,24 @@ fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &App
 
     let top_processes = get_top_processes(sys, process_count, app_state.process_sort_mode);
 
+    // Apply filter if present
+    let filter_lower = app_state.filter_text.to_lowercase();
+    let filtered_processes: Vec<_> = if filter_lower.is_empty() {
+        top_processes.iter().collect()
+    } else {
+        top_processes.iter()
+            .filter(|p| {
+                p.name.to_lowercase().contains(&filter_lower) ||
+                p.user.to_lowercase().contains(&filter_lower)
+            })
+            .collect()
+    };
+
     // Organize processes: group threads under their parent process
     let mut rows: Vec<Row> = Vec::new();
     let mut seen_processes = std::collections::HashSet::new();
 
-    for p in &top_processes {
+    for p in &filtered_processes {
         // Skip threads for now, we'll add them under their parent
         if p.is_thread {
             continue;
@@ -1042,7 +1179,7 @@ fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &App
         ]));
 
         // Now find and add threads for this process
-        let threads: Vec<_> = top_processes.iter()
+        let threads: Vec<_> = filtered_processes.iter()
             .filter(|t| t.is_thread && t.thread_group_id == p.pid)
             .collect();
 
@@ -1155,7 +1292,7 @@ fn render_help_text(f: &mut Frame, area: Rect, app_state: &AppState) {
         ProcessSortMode::NameDesc => "Name↓",
     };
 
-    let help_text = Line::from(vec![
+    let mut help_spans = vec![
         Span::styled("Sort: ", Style::default().fg(Color::Gray)),
         Span::styled("[C]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled("PU  ", Style::default().fg(Color::Gray)),
@@ -1168,9 +1305,25 @@ fn render_help_text(f: &mut Frame, area: Rect, app_state: &AppState) {
         Span::styled("  |  Current: ", Style::default().fg(Color::Gray)),
         Span::styled(sort_name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         Span::styled("  |  ", Style::default().fg(Color::Gray)),
-        Span::styled("[Q]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::styled("uit", Style::default().fg(Color::Gray)),
-    ]);
+        Span::styled("[/]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("Filter", Style::default().fg(Color::Gray)),
+    ];
+
+    // Show filter status
+    if app_state.filter_mode {
+        help_spans.push(Span::styled(": ", Style::default().fg(Color::Gray)));
+        help_spans.push(Span::styled(&app_state.filter_text, Style::default().fg(Color::Yellow)));
+        help_spans.push(Span::styled("_", Style::default().fg(Color::Yellow))); // cursor
+    } else if !app_state.filter_text.is_empty() {
+        help_spans.push(Span::styled(": ", Style::default().fg(Color::Gray)));
+        help_spans.push(Span::styled(&app_state.filter_text, Style::default().fg(Color::Green)));
+    }
+
+    help_spans.push(Span::styled("  |  ", Style::default().fg(Color::Gray)));
+    help_spans.push(Span::styled("[Q]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    help_spans.push(Span::styled("uit", Style::default().fg(Color::Gray)));
+
+    let help_text = Line::from(help_spans);
 
     let paragraph = Paragraph::new(help_text);
     f.render_widget(paragraph, area);
