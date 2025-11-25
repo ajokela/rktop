@@ -59,18 +59,20 @@ pub fn get_top_processes(sys: &System, count: usize, sort_mode: ProcessSortMode)
         .collect();
 
     // Sort the minimal list based on selected mode
+    // Use unwrap_or(Equal) to safely handle potential NaN values in CPU/memory percentages
+    use std::cmp::Ordering;
     match sort_mode {
         ProcessSortMode::CpuDesc => {
-            minimal_processes.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+            minimal_processes.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
         }
         ProcessSortMode::CpuAsc => {
-            minimal_processes.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+            minimal_processes.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
         }
         ProcessSortMode::MemoryDesc => {
-            minimal_processes.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+            minimal_processes.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal));
         }
         ProcessSortMode::MemoryAsc => {
-            minimal_processes.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap());
+            minimal_processes.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(Ordering::Equal));
         }
         ProcessSortMode::PidAsc => {
             minimal_processes.sort_by_key(|p| p.0);

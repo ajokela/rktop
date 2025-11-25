@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row, Table},
     Frame, Terminal,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
@@ -146,9 +146,9 @@ struct AppState {
     running_procs: u64,
     blocked_procs: u64,
     // Historical data for sparklines (last 60 samples at 1 second each)
-    cpu_history: Vec<f32>,
-    gpu_history: Vec<f32>,
-    npu_history: Vec<f32>,
+    cpu_history: VecDeque<f32>,
+    gpu_history: VecDeque<f32>,
+    npu_history: VecDeque<f32>,
     // Process filtering
     filter_text: String,
     filter_mode: bool, // true when actively editing filter
@@ -220,9 +220,9 @@ impl AppState {
             prev_cpu_time: CpuStats::default(),
             running_procs: 0,
             blocked_procs: 0,
-            cpu_history: Vec::new(),
-            gpu_history: Vec::new(),
-            npu_history: Vec::new(),
+            cpu_history: VecDeque::new(),
+            gpu_history: VecDeque::new(),
+            npu_history: VecDeque::new(),
             filter_text: String::new(),
             filter_mode: false,
         }
@@ -232,16 +232,16 @@ impl AppState {
         const MAX_HISTORY: usize = 60; // Keep 60 seconds of history
 
         // Update CPU history
-        self.cpu_history.push(total_cpu);
+        self.cpu_history.push_back(total_cpu);
         if self.cpu_history.len() > MAX_HISTORY {
-            self.cpu_history.remove(0);
+            self.cpu_history.pop_front();
         }
 
         // Update GPU history
         if let Some(gpu_usage) = get_gpu_usage() {
-            self.gpu_history.push(gpu_usage);
+            self.gpu_history.push_back(gpu_usage);
             if self.gpu_history.len() > MAX_HISTORY {
-                self.gpu_history.remove(0);
+                self.gpu_history.pop_front();
             }
         }
 
@@ -249,9 +249,9 @@ impl AppState {
         let npu_loads = get_npu_load();
         if !npu_loads.is_empty() {
             let avg_npu: f32 = npu_loads.iter().map(|&x| x as f32).sum::<f32>() / npu_loads.len() as f32;
-            self.npu_history.push(avg_npu);
+            self.npu_history.push_back(avg_npu);
             if self.npu_history.len() > MAX_HISTORY {
-                self.npu_history.remove(0);
+                self.npu_history.pop_front();
             }
         }
     }
@@ -592,7 +592,7 @@ fn ui(f: &mut Frame, sys: &System, app_state: &AppState) {
 
 /// Render a sparkline from historical data
 /// Uses block characters to create a mini-chart: ▁▂▃▄▅▆▇█
-fn render_sparkline(data: &[f32], max_value: f32) -> String {
+fn render_sparkline(data: &VecDeque<f32>, max_value: f32) -> String {
     if data.is_empty() {
         return String::new();
     }
