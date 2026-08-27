@@ -182,9 +182,9 @@ pub fn get_hwmon_sensors() -> Vec<(String, String)> {
 }
 
 
-/// Read GPU utilization from Mali debugfs (using cached file descriptors)
+/// Read GPU utilization from Mali debugfs
 pub fn get_gpu_usage() -> Option<f32> {
-    let path = "/sys/kernel/debug/mali0/dvfs_utilization";
+    let path = MALI_UTILISATION_PATH;
     if let Ok(content) = read_cached_file(path) {
         // Parse "busy_time: X idle_time: Y" format
         let parts: Vec<&str> = content.split_whitespace().collect();
@@ -348,6 +348,25 @@ fn find_devfreq(drivers: &[&str], compat_hints: &[&str]) -> Option<PathBuf> {
 
     None
 }
+
+/// Whether this system has a GPU at all.
+///
+/// Callers must not infer this from a utilisation sample: the fdinfo path
+/// returns nothing until it has two samples to compare.
+pub fn gpu_present() -> bool {
+    gpu_devfreq().is_some()
+        || vendor_utilisation_present()
+        || drm_device(GPU_DRIVERS).is_some()
+}
+
+/// Whether the vendor driver exposes utilisation. When it does, the fdinfo
+/// path is unnecessary and its whole-system fd walk is pure cost.
+fn vendor_utilisation_present() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| Path::new(MALI_UTILISATION_PATH).exists())
+}
+
+const MALI_UTILISATION_PATH: &str = "/sys/kernel/debug/mali0/dvfs_utilization";
 
 /// Devfreq node of the GPU. Resolved once: the binding cannot change while
 /// the process runs, and resolving it walks sysfs.

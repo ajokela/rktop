@@ -166,7 +166,9 @@ impl AppState {
         let rkllm_version = get_librkllmrt_version();
 
         // Cache hardware availability (check once at startup)
-        let has_gpu = get_gpu_usage().is_some();
+        // Probe for the device, not for a metric: the fdinfo path reports
+        // nothing until it has two samples to compare.
+        let has_gpu = gpu_present();
         let has_npu = !get_npu_load().is_empty();
         let has_rga = get_rga_load().is_some();
 
@@ -885,37 +887,52 @@ fn render_system_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
 }
 
 fn render_gpu_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
-    if let Some(usage) = get_gpu_usage() {
-        let freq = get_gpu_frequency();
-        let freq_str = freq.map(|f| format!(" {} MHz", f)).unwrap_or_default();
-
-        let bar_width = 30;
-        let filled = ((usage / 100.0) * bar_width as f32) as usize;
-        let bar = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-
-        let mut lines = vec![Line::from(vec![
-            Span::raw("Mali0 "),
-            Span::styled(bar, Style::default().fg(Color::Green)),
-            Span::raw(format!(" {:>5.2}%{}", usage, freq_str)),
-        ])];
-
-        // Add sparkline if we have history
-        if !app_state.gpu_history.is_empty() {
-            let sparkline = render_sparkline(&app_state.gpu_history, 100.0);
-            lines.push(Line::from(vec![
-                Span::raw("History: "),
-                Span::styled(sparkline, Style::default().fg(Color::Green)),
-            ]));
-        }
-
-        let block = Block::default()
-            .title("GPU")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green));
-
-        let paragraph = Paragraph::new(lines).block(block);
-        f.render_widget(paragraph, area);
+    let usage = get_gpu_usage();
+    let freq = get_gpu_frequency();
+    if usage.is_none() && freq.is_none() {
+        return;
     }
+
+    let freq_str = freq.map(|f| format!(" {} MHz", f)).unwrap_or_default();
+
+    let mut lines = match usage {
+        Some(usage) => {
+            let bar_width = 30;
+            let filled = ((usage / 100.0) * bar_width as f32) as usize;
+            let bar = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+            vec![Line::from(vec![
+                Span::raw("Mali0 "),
+                Span::styled(bar, Style::default().fg(Color::Green)),
+                Span::raw(format!(" {:>5.2}%{}", usage, freq_str)),
+            ])]
+        }
+        // Report what is available instead of hiding the GPU.
+        None => vec![Line::from(vec![
+            Span::raw("Mali0 "),
+            Span::styled(
+                "utilisation unavailable",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(freq_str),
+        ])],
+    };
+
+    // Add sparkline if we have history
+    if !app_state.gpu_history.is_empty() {
+        let sparkline = render_sparkline(&app_state.gpu_history, 100.0);
+        lines.push(Line::from(vec![
+            Span::raw("History: "),
+            Span::styled(sparkline, Style::default().fg(Color::Green)),
+        ]));
+    }
+
+    let block = Block::default()
+        .title("GPU")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
 }
 
 fn render_npu_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
