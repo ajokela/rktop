@@ -455,8 +455,15 @@ fn run_app(
         // Update processes based on configured rate
         // Refresh with shallow read to limit syscalls, but remove dead processes
         if last_process_update.elapsed() >= Duration::from_secs(config.processes) {
+            // Collect only what the table shows. The default refresh also
+            // reads each process's command line, executable path, working
+            // directory, environment and disk usage.
+            let kind = sysinfo::ProcessRefreshKind::new()
+                .with_cpu()
+                .with_memory()
+                .with_user(sysinfo::UpdateKind::OnlyIfNotSet);
             // Remove processes that no longer exist
-            sys.refresh_processes(ProcessesToUpdate::All, true);
+            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
             *last_process_update = Instant::now();
         }
 
@@ -1177,6 +1184,11 @@ fn render_process_panel(f: &mut Frame, area: Rect, sys: &System, app_state: &App
     let mut seen_processes = std::collections::HashSet::new();
 
     for p in &filtered_processes {
+        // The table does not scroll, so extra rows are discarded.
+        if rows.len() >= available_rows {
+            break;
+        }
+
         // Skip threads for now, we'll add them under their parent
         if p.is_thread {
             continue;
