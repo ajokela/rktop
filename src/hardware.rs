@@ -1,6 +1,7 @@
 use regex::Regex;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use goblin::Object;
 use crate::file_cache::{read_cached_file, read_cached_u32, read_cached_i32};
 
@@ -180,6 +181,7 @@ pub fn get_hwmon_sensors() -> Vec<(String, String)> {
     sensors
 }
 
+
 /// Read GPU utilization from Mali debugfs (using cached file descriptors)
 pub fn get_gpu_usage() -> Option<f32> {
     let path = "/sys/kernel/debug/mali0/dvfs_utilization";
@@ -257,30 +259,143 @@ pub fn get_cpu_freq_ranges() -> Vec<(u32, u32)> {
     ranges
 }
 
-/// Read GPU frequency
-pub fn get_gpu_frequency() -> Option<u32> {
-    let paths = [
-        "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor/cur_freq",
-        "/sys/class/devfreq/fb000000.gpu/cur_freq",
-    ];
 
-    for path in &paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(freq_hz) = content.trim().parse::<u64>() {
-                return Some((freq_hz / 1_000_000) as u32); // Convert to MHz
+/// Kernel drivers that bind to a Mali GPU on Rockchip parts.
+const GPU_DRIVERS: &[&str] = &["panfrost", "panthor", "mali", "bifrost", "midgard"];
+
+/// Kernel drivers that bind to a Rockchip NPU.
+const NPU_DRIVERS: &[&str] = &["rknpu"];
+
+/// A devfreq node is usable only if its `cur_freq` parses.
+fn has_cur_freq(node: &Path) -> bool {
+    fs::read_to_string(node.join("cur_freq"))
+        .ok()
+        .and_then(|c| c.trim().parse::<u64>().ok())
+        .is_some()
+}
+
+/// The sysfs device of a DRM card bound to one of `drivers`.
+fn drm_device(drivers: &[&str]) -> Option<PathBuf> {
+    for card in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let name = card.file_name();
+        let name = name.to_string_lossy();
+        // Match `card0`, not the `card0-HDMI-A-1` connector nodes.
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device = card.path().join("device");
+        if let Some(d) = driver_of(&device) {
+            if drivers.contains(&d.as_str()) {
+                return Some(device);
             }
         }
     }
     None
 }
 
-/// Read NPU frequency (using cached file descriptors)
+/// Resolve the `driver` symlink of a sysfs device node to the driver name.
+fn driver_of(device: &Path) -> Option<String> {
+    fs::read_link(device.join("driver"))
+        .ok()?
+        .file_name()?
+        .to_str()
+        .map(|s| s.to_ascii_lowercase())
+}
+
+/// Find the devfreq node controlled by one of `drivers`.
+///
+/// Device addresses are per-SoC, but the driver bound to the device is not,
+/// so resolve the hardware by asking the kernel which driver owns it. Tries
+/// DRM cards first, then the devfreq class, then the device tree
+/// `compatible` string.
+fn find_devfreq(drivers: &[&str], compat_hints: &[&str]) -> Option<PathBuf> {
+    // Via DRM, which ties the node to the actual render device.
+    if let Some(device) = drm_device(drivers) {
+        if let Ok(nodes) = fs::read_dir(device.join("devfreq")) {
+            for node in nodes.flatten() {
+                if has_cur_freq(&node.path()) {
+                    return Some(node.path());
+                }
+            }
+        }
+    }
+
+    // Via the devfreq class.
+    let devfreq = match fs::read_dir("/sys/class/devfreq") {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    let nodes: Vec<PathBuf> = devfreq.flatten().map(|e| e.path()).collect();
+
+    for node in &nodes {
+        if let Some(d) = driver_of(&node.join("device")) {
+            if drivers.contains(&d.as_str()) && has_cur_freq(node) {
+                return Some(node.clone());
+            }
+        }
+    }
+
+    // Via the device tree, which names the IP block even when the driver
+    // name is unusual.
+    for node in &nodes {
+        if let Ok(compat) = fs::read(node.join("device/of_node/compatible")) {
+            let compat = String::from_utf8_lossy(&compat).to_ascii_lowercase();
+            if compat_hints.iter().any(|h| compat.contains(h)) && has_cur_freq(node) {
+                return Some(node.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// Devfreq node of the GPU. Resolved once: the binding cannot change while
+/// the process runs, and resolving it walks sysfs.
+fn gpu_devfreq() -> Option<&'static Path> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| find_devfreq(GPU_DRIVERS, &["mali", "-gpu"]))
+        .as_deref()
+}
+
+/// Devfreq node of the NPU, resolved once.
+fn npu_devfreq() -> Option<&'static Path> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| find_devfreq(NPU_DRIVERS, &["rknpu", "-npu"]))
+        .as_deref()
+}
+
+/// Read `cur_freq` from a devfreq node and convert Hz to MHz.
+fn devfreq_mhz(node: &Path) -> Option<u32> {
+    let content = fs::read_to_string(node.join("cur_freq")).ok()?;
+    let hz = content.trim().parse::<u64>().ok()?;
+    Some((hz / 1_000_000) as u32)
+}
+
+/// Read GPU frequency
+pub fn get_gpu_frequency() -> Option<u32> {
+    if let Some(mhz) = gpu_devfreq().and_then(devfreq_mhz) {
+        return Some(mhz);
+    }
+    // Kept as a last resort so this cannot regress hardware the driver
+    // lookup was never tested on.
+    for path in &[
+        "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor",
+        "/sys/class/devfreq/fb000000.gpu",
+    ] {
+        if let Some(mhz) = devfreq_mhz(Path::new(path)) {
+            return Some(mhz);
+        }
+    }
+    None
+}
+
+/// Read NPU frequency
 pub fn get_npu_frequency() -> Option<u32> {
-    let path = "/sys/class/devfreq/fdab0000.npu/cur_freq";
-    read_cached_file(path)
-        .ok()
-        .and_then(|content| content.trim().parse::<u64>().ok())
-        .map(|freq_hz| (freq_hz / 1_000_000) as u32)
+    npu_devfreq()
+        .and_then(devfreq_mhz)
+        .or_else(|| devfreq_mhz(Path::new("/sys/class/devfreq/fdab0000.npu")))
 }
 
 /// Read NPU load percentages for each core (using cached file descriptors)
