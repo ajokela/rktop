@@ -466,6 +466,11 @@ pub fn get_rga_load() -> Option<Vec<(String, f32)>> {
 
 /// Get full board name
 pub fn get_board_name() -> String {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(detect_board_name).clone()
+}
+
+fn detect_board_name() -> String {
     let paths = [
         "/proc/device-tree/model",
         "/sys/firmware/devicetree/base/model",
@@ -488,12 +493,45 @@ pub fn get_board_name() -> String {
     "Unknown Board".to_string()
 }
 
-/// Detect Rockchip SoC model
+/// Detect Rockchip SoC model. Cached: it cannot change while the process
+/// runs, and resolving it compiles regexes and reads files.
 pub fn get_rk_model() -> String {
-    let board_name = get_board_name();
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(detect_rk_model).clone()
+}
 
-    // Extract RKxxxx pattern
-    let re = Regex::new(r"\b(RK\d+)\b").unwrap();
+fn detect_rk_model() -> String {
+    // The device tree `compatible` property is ordered most-specific-first,
+    // so the board comes first and the SoC last:
+    //
+    //     gameconsole,r35s\0gameconsole,r36s\0rockchip,rk3326\0
+    //
+    // Deriving the SoC from the board name only works when the vendor puts it
+    // there, and many do not.
+    for path in &[
+        "/proc/device-tree/compatible",
+        "/sys/firmware/devicetree/base/compatible",
+    ] {
+        let raw = match fs::read(path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        // Rockchip uses three prefixes: rk3588, px30, rv1126. Suffixed
+        // variants exist, e.g. rk3588s, rk3399pro.
+        // Not anchored at the end: some boards only declare the combined
+        // form, e.g. `rockchip,rk3588-orangepi-5-plus`.
+        let re = Regex::new(r"^rockchip,((?:rk|px|rv)\d{2,4}[a-z0-9]*)").unwrap();
+        // The SoC entry is the least specific, hence last.
+        for entry in String::from_utf8_lossy(&raw).split('\0').rev() {
+            if let Some(cap) = re.captures(entry.trim()) {
+                return cap[1].to_uppercase();
+            }
+        }
+    }
+
+    // Boards named after their SoC still work, e.g. "Rockchip RK3588 EVB".
+    let board_name = get_board_name();
+    let re = Regex::new(r"\b((?:RK|PX|RV)\d+[A-Za-z0-9]*)\b").unwrap();
     if let Some(cap) = re.captures(&board_name) {
         return cap[1].to_uppercase();
     }
