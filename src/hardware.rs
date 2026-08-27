@@ -1,6 +1,9 @@
 use regex::Regex;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use goblin::Object;
 use crate::file_cache::{read_cached_file, read_cached_u32, read_cached_i32};
 
@@ -180,9 +183,240 @@ pub fn get_hwmon_sensors() -> Vec<(String, String)> {
     sensors
 }
 
-/// Read GPU utilization from Mali debugfs (using cached file descriptors)
+
+/// Locate every DRM client's fdinfo file.
+///
+/// Walks every open file descriptor on the system, so it is not run on every
+/// sample. See `get_gpu_engine_usage`.
+fn scan_drm_fdinfo() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    let procs = match fs::read_dir("/proc") {
+        Ok(p) => p,
+        Err(_) => return paths,
+    };
+
+    for proc_entry in procs.flatten() {
+        let pid = proc_entry.file_name();
+        let pid = pid.to_string_lossy();
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+
+        let fds = match fs::read_dir(proc_entry.path().join("fd")) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+
+        for fd in fds.flatten() {
+            // Cheaper than reading fdinfo for every open file, most of which
+            // are not DRM.
+            match fs::read_link(fd.path()) {
+                Ok(target) if target.to_string_lossy().starts_with("/dev/dri/") => {}
+                _ => continue,
+            }
+            paths.push(proc_entry.path().join("fdinfo").join(fd.file_name()));
+        }
+    }
+
+    paths
+}
+
+/// Busy time per (client, engine) over the given fdinfo files.
+///
+/// Keyed by client rather than summed per engine so that a client appearing
+/// between two samples can be excluded from the delta; its counter starts at
+/// whatever it had already accumulated, which would otherwise read as a
+/// burst of activity.
+///
+/// Also reports whether every path was still readable; a vanished path means
+/// the cached client list is stale.
+fn accumulate_engines(paths: &[PathBuf]) -> (HashMap<(String, String), u64>, bool) {
+    let mut totals: HashMap<(String, String), u64> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all_present = true;
+
+    for path in paths {
+        let info = match fs::read_to_string(path) {
+            Ok(i) => i,
+            Err(_) => {
+                all_present = false;
+                continue;
+            }
+        };
+
+        let mut driver = None;
+        let mut pdev = None;
+        let mut client_id = None;
+        let mut engines: Vec<(&str, u64)> = Vec::new();
+
+        for line in info.lines() {
+            let (key, value) = match line.split_once(':') {
+                Some(kv) => kv,
+                None => continue,
+            };
+            let value = value.trim();
+
+            match key {
+                "drm-driver" => driver = Some(value.to_ascii_lowercase()),
+                "drm-pdev" => pdev = Some(value.to_string()),
+                "drm-client-id" => client_id = Some(value),
+                _ => {
+                    if let Some(engine) = key.strip_prefix("drm-engine-") {
+                        // Some drivers also emit drm-engine-capacity-<name>,
+                        // which is a count rather than a duration.
+                        let mut tokens = value.split_whitespace();
+                        match (tokens.next().and_then(|n| n.parse::<u64>().ok()), tokens.next()) {
+                            (Some(ns), Some("ns")) => engines.push((engine, ns)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only GPU clients carry engine counters, and ignoring the others
+        // keeps a display client from occupying a GPU client's id.
+        match &driver {
+            Some(d) if GPU_DRIVERS.contains(&d.as_str()) => {}
+            _ => continue,
+        }
+
+        // Client ids are allocated per DRM device, so they collide across
+        // devices. drm-pdev disambiguates where the driver emits it.
+        let client_id = match client_id {
+            Some(id) => id,
+            None => continue,
+        };
+        let client = format!(
+            "{}:{}",
+            pdev.as_deref().unwrap_or(driver.as_deref().unwrap_or("")),
+            client_id
+        );
+
+        // A forked child inherits its parent's DRM file descriptor, so one
+        // client appears under several pids. Count it once.
+        if !seen.insert(client.clone()) {
+            continue;
+        }
+
+        for (engine, ns) in engines {
+            *totals.entry((client.clone(), engine.to_string())).or_insert(0) += ns;
+        }
+    }
+
+    (totals, all_present)
+}
+
+struct EngineSampler {
+    taken_at: Instant,
+    totals: HashMap<(String, String), u64>,
+    result: Vec<(String, f32)>,
+    clients: Vec<PathBuf>,
+    scanned_at: Instant,
+}
+
+/// Shortest interval between samples. `get_gpu_usage` is called several times
+/// per redraw, and sampling on each call would divide a busy-time delta by a
+/// near-zero interval.
+///
+/// Note that panfrost and panthor gate these counters behind the device's
+/// `profiling` attribute; where it is off, every engine reads as idle.
+const ENGINE_SAMPLE_INTERVAL_MS: u128 = 900;
+
+/// How long a discovered client list is reused. Clients come and go rarely
+/// compared to the sample rate, and finding them is the expensive part. The
+/// cost is that a new client can take this long to appear.
+const CLIENT_RESCAN_INTERVAL_MS: u128 = 5_000;
+
+/// Per-engine utilisation as (engine, percent), from DRM fdinfo.
+pub fn get_gpu_engine_usage() -> Vec<(String, f32)> {
+    if !fdinfo_sampling_useful() {
+        return Vec::new();
+    }
+
+    static SAMPLER: OnceLock<Mutex<Option<EngineSampler>>> = OnceLock::new();
+    let sampler = SAMPLER.get_or_init(|| Mutex::new(None));
+
+    let mut guard = match sampler.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    if let Some(prev) = guard.as_ref() {
+        if prev.taken_at.elapsed().as_millis() < ENGINE_SAMPLE_INTERVAL_MS {
+            return prev.result.clone();
+        }
+    }
+
+    // Reuse the known clients while they are fresh and none has gone away.
+    let cached = guard
+        .as_ref()
+        .filter(|p| p.scanned_at.elapsed().as_millis() < CLIENT_RESCAN_INTERVAL_MS)
+        .map(|p| (p.clients.clone(), p.scanned_at));
+
+    let (clients, scanned_at, totals) = match cached {
+        Some((clients, scanned_at)) => match accumulate_engines(&clients) {
+            (totals, true) => (clients, scanned_at, totals),
+            _ => rescan_drm_clients(),
+        },
+        None => rescan_drm_clients(),
+    };
+
+    let now = Instant::now();
+    let result = match guard.as_ref() {
+        // The first sample only establishes a baseline.
+        None => Vec::new(),
+        Some(prev) => {
+            let elapsed_ns = now.duration_since(prev.taken_at).as_nanos();
+            if elapsed_ns == 0 {
+                prev.result.clone()
+            } else {
+                // Only clients present in both samples have a meaningful
+                // delta. Ones that appeared bring their whole history with
+                // them; ones that left take theirs away.
+                let mut deltas: HashMap<&str, u64> = HashMap::new();
+                for (key, ns) in &totals {
+                    if let Some(before) = prev.totals.get(key) {
+                        *deltas.entry(key.1.as_str()).or_insert(0) +=
+                            ns.saturating_sub(*before);
+                    }
+                }
+
+                let mut per_engine: Vec<(String, f32)> = deltas
+                    .into_iter()
+                    .map(|(engine, delta)| {
+                        let pct = (delta as f64 / elapsed_ns as f64 * 100.0) as f32;
+                        (engine.to_string(), pct.clamp(0.0, 100.0))
+                    })
+                    .collect();
+                per_engine.sort_by(|a, b| a.0.cmp(&b.0));
+                per_engine
+            }
+        }
+    };
+
+    *guard = Some(EngineSampler {
+        taken_at: now,
+        totals,
+        result: result.clone(),
+        clients,
+        scanned_at,
+    });
+
+    result
+}
+
+fn rescan_drm_clients() -> (Vec<PathBuf>, Instant, HashMap<(String, String), u64>) {
+    let clients = scan_drm_fdinfo();
+    let totals = accumulate_engines(&clients).0;
+    (clients, Instant::now(), totals)
+}
+
+/// Read GPU utilization, from the vendor debugfs if present and from DRM
+/// fdinfo otherwise.
 pub fn get_gpu_usage() -> Option<f32> {
-    let path = "/sys/kernel/debug/mali0/dvfs_utilization";
+    let path = MALI_UTILISATION_PATH;
     if let Ok(content) = read_cached_file(path) {
         // Parse "busy_time: X idle_time: Y" format
         let parts: Vec<&str> = content.split_whitespace().collect();
@@ -192,11 +426,14 @@ pub fn get_gpu_usage() -> Option<f32> {
         for i in (0..parts.len()).step_by(2) {
             if i + 1 < parts.len() {
                 let key = parts[i].trim_end_matches(':');
-                let value = parts[i + 1].parse::<u64>().ok()?;
-                match key {
-                    "busy_time" => busy_time = value,
-                    "idle_time" => idle_time = value,
-                    _ => {}
+                // Do not bail out of the function here: every debugfs
+                // failure mode should reach the fdinfo fallback below.
+                if let Ok(value) = parts[i + 1].parse::<u64>() {
+                    match key {
+                        "busy_time" => busy_time = value,
+                        "idle_time" => idle_time = value,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -206,7 +443,17 @@ pub fn get_gpu_usage() -> Option<f32> {
             return Some((busy_time as f32 / total_time as f32) * 100.0);
         }
     }
-    None
+
+    // No vendor debugfs, so fall back to DRM fdinfo.
+    //
+    // Report the busiest engine rather than the sum: vertex/tiler and
+    // fragment run on separate job slots that overlap, so adding them can
+    // exceed 100% while the GPU is only pipelining.
+    let engines = get_gpu_engine_usage();
+    engines
+        .iter()
+        .map(|(_, pct)| *pct)
+        .fold(None::<f32>, |acc, pct| Some(acc.map_or(pct, |a| a.max(pct))))
 }
 
 /// Read CPU frequencies for each core (using cached file descriptors)
@@ -257,30 +504,169 @@ pub fn get_cpu_freq_ranges() -> Vec<(u32, u32)> {
     ranges
 }
 
-/// Read GPU frequency
-pub fn get_gpu_frequency() -> Option<u32> {
-    let paths = [
-        "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor/cur_freq",
-        "/sys/class/devfreq/fb000000.gpu/cur_freq",
-    ];
 
-    for path in &paths {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Ok(freq_hz) = content.trim().parse::<u64>() {
-                return Some((freq_hz / 1_000_000) as u32); // Convert to MHz
+/// Kernel drivers that bind to a Mali GPU on Rockchip parts.
+const GPU_DRIVERS: &[&str] = &["panfrost", "panthor", "mali", "bifrost", "midgard"];
+
+/// Kernel drivers that bind to a Rockchip NPU.
+const NPU_DRIVERS: &[&str] = &["rknpu"];
+
+/// A devfreq node is usable only if its `cur_freq` parses.
+fn has_cur_freq(node: &Path) -> bool {
+    fs::read_to_string(node.join("cur_freq"))
+        .ok()
+        .and_then(|c| c.trim().parse::<u64>().ok())
+        .is_some()
+}
+
+/// The sysfs device of a DRM card bound to one of `drivers`.
+fn drm_device(drivers: &[&str]) -> Option<PathBuf> {
+    for card in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let name = card.file_name();
+        let name = name.to_string_lossy();
+        // Match `card0`, not the `card0-HDMI-A-1` connector nodes.
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device = card.path().join("device");
+        if let Some(d) = driver_of(&device) {
+            if drivers.contains(&d.as_str()) {
+                return Some(device);
             }
         }
     }
     None
 }
 
-/// Read NPU frequency (using cached file descriptors)
+/// Resolve the `driver` symlink of a sysfs device node to the driver name.
+fn driver_of(device: &Path) -> Option<String> {
+    fs::read_link(device.join("driver"))
+        .ok()?
+        .file_name()?
+        .to_str()
+        .map(|s| s.to_ascii_lowercase())
+}
+
+/// Find the devfreq node controlled by one of `drivers`.
+///
+/// Device addresses are per-SoC, but the driver bound to the device is not,
+/// so resolve the hardware by asking the kernel which driver owns it. Tries
+/// DRM cards first, then the devfreq class, then the device tree
+/// `compatible` string.
+fn find_devfreq(drivers: &[&str], compat_hints: &[&str]) -> Option<PathBuf> {
+    // Via DRM, which ties the node to the actual render device.
+    if let Some(device) = drm_device(drivers) {
+        if let Ok(nodes) = fs::read_dir(device.join("devfreq")) {
+            for node in nodes.flatten() {
+                if has_cur_freq(&node.path()) {
+                    return Some(node.path());
+                }
+            }
+        }
+    }
+
+    // Via the devfreq class.
+    let devfreq = match fs::read_dir("/sys/class/devfreq") {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    let nodes: Vec<PathBuf> = devfreq.flatten().map(|e| e.path()).collect();
+
+    for node in &nodes {
+        if let Some(d) = driver_of(&node.join("device")) {
+            if drivers.contains(&d.as_str()) && has_cur_freq(node) {
+                return Some(node.clone());
+            }
+        }
+    }
+
+    // Via the device tree, which names the IP block even when the driver
+    // name is unusual.
+    for node in &nodes {
+        if let Ok(compat) = fs::read(node.join("device/of_node/compatible")) {
+            let compat = String::from_utf8_lossy(&compat).to_ascii_lowercase();
+            if compat_hints.iter().any(|h| compat.contains(h)) && has_cur_freq(node) {
+                return Some(node.clone());
+            }
+        }
+    }
+
+    None
+}
+
+/// Whether this system has a GPU at all.
+///
+/// Callers must not infer this from a utilisation sample: the fdinfo path
+/// returns nothing until it has two samples to compare.
+pub fn gpu_present() -> bool {
+    gpu_devfreq().is_some()
+        || vendor_utilisation_present()
+        || drm_device(GPU_DRIVERS).is_some()
+}
+
+/// Whether the vendor driver exposes utilisation. When it does, the fdinfo
+/// path is unnecessary and its whole-system fd walk is pure cost.
+fn vendor_utilisation_present() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| Path::new(MALI_UTILISATION_PATH).exists())
+}
+
+/// Whether sampling DRM fdinfo can produce anything. Walking every open file
+/// descriptor on the system is wasted work otherwise.
+fn fdinfo_sampling_useful() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| !vendor_utilisation_present() && Path::new("/dev/dri").exists())
+}
+
+const MALI_UTILISATION_PATH: &str = "/sys/kernel/debug/mali0/dvfs_utilization";
+
+/// Devfreq node of the GPU. Resolved once: the binding cannot change while
+/// the process runs, and resolving it walks sysfs.
+fn gpu_devfreq() -> Option<&'static Path> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| find_devfreq(GPU_DRIVERS, &["mali", "-gpu"]))
+        .as_deref()
+}
+
+/// Devfreq node of the NPU, resolved once.
+fn npu_devfreq() -> Option<&'static Path> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| find_devfreq(NPU_DRIVERS, &["rknpu", "-npu"]))
+        .as_deref()
+}
+
+/// Read `cur_freq` from a devfreq node and convert Hz to MHz.
+fn devfreq_mhz(node: &Path) -> Option<u32> {
+    let content = fs::read_to_string(node.join("cur_freq")).ok()?;
+    let hz = content.trim().parse::<u64>().ok()?;
+    Some((hz / 1_000_000) as u32)
+}
+
+/// Read GPU frequency
+pub fn get_gpu_frequency() -> Option<u32> {
+    if let Some(mhz) = gpu_devfreq().and_then(devfreq_mhz) {
+        return Some(mhz);
+    }
+    // Kept as a last resort so this cannot regress hardware the driver
+    // lookup was never tested on.
+    for path in &[
+        "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor",
+        "/sys/class/devfreq/fb000000.gpu",
+    ] {
+        if let Some(mhz) = devfreq_mhz(Path::new(path)) {
+            return Some(mhz);
+        }
+    }
+    None
+}
+
+/// Read NPU frequency
 pub fn get_npu_frequency() -> Option<u32> {
-    let path = "/sys/class/devfreq/fdab0000.npu/cur_freq";
-    read_cached_file(path)
-        .ok()
-        .and_then(|content| content.trim().parse::<u64>().ok())
-        .map(|freq_hz| (freq_hz / 1_000_000) as u32)
+    npu_devfreq()
+        .and_then(devfreq_mhz)
+        .or_else(|| devfreq_mhz(Path::new("/sys/class/devfreq/fdab0000.npu")))
 }
 
 /// Read NPU load percentages for each core (using cached file descriptors)
@@ -351,6 +737,11 @@ pub fn get_rga_load() -> Option<Vec<(String, f32)>> {
 
 /// Get full board name
 pub fn get_board_name() -> String {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(detect_board_name).clone()
+}
+
+fn detect_board_name() -> String {
     let paths = [
         "/proc/device-tree/model",
         "/sys/firmware/devicetree/base/model",
@@ -373,12 +764,45 @@ pub fn get_board_name() -> String {
     "Unknown Board".to_string()
 }
 
-/// Detect Rockchip SoC model
+/// Detect Rockchip SoC model. Cached: it cannot change while the process
+/// runs, and resolving it compiles regexes and reads files.
 pub fn get_rk_model() -> String {
-    let board_name = get_board_name();
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(detect_rk_model).clone()
+}
 
-    // Extract RKxxxx pattern
-    let re = Regex::new(r"\b(RK\d+)\b").unwrap();
+fn detect_rk_model() -> String {
+    // The device tree `compatible` property is ordered most-specific-first,
+    // so the board comes first and the SoC last:
+    //
+    //     gameconsole,r35s\0gameconsole,r36s\0rockchip,rk3326\0
+    //
+    // Deriving the SoC from the board name only works when the vendor puts it
+    // there, and many do not.
+    for path in &[
+        "/proc/device-tree/compatible",
+        "/sys/firmware/devicetree/base/compatible",
+    ] {
+        let raw = match fs::read(path) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        // Rockchip uses three prefixes: rk3588, px30, rv1126. Suffixed
+        // variants exist, e.g. rk3588s, rk3399pro.
+        // Not anchored at the end: some boards only declare the combined
+        // form, e.g. `rockchip,rk3588-orangepi-5-plus`.
+        let re = Regex::new(r"^rockchip,((?:rk|px|rv)\d{2,4}[a-z0-9]*)").unwrap();
+        // The SoC entry is the least specific, hence last.
+        for entry in String::from_utf8_lossy(&raw).split('\0').rev() {
+            if let Some(cap) = re.captures(entry.trim()) {
+                return cap[1].to_uppercase();
+            }
+        }
+    }
+
+    // Boards named after their SoC still work, e.g. "Rockchip RK3588 EVB".
+    let board_name = get_board_name();
+    let re = Regex::new(r"\b((?:RK|PX|RV)\d+[A-Za-z0-9]*)\b").unwrap();
     if let Some(cap) = re.captures(&board_name) {
         return cap[1].to_uppercase();
     }
