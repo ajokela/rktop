@@ -15,7 +15,7 @@ use ratatui::{
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
-use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
+use sysinfo::{CpuRefreshKind, Disks, Networks, ProcessesToUpdate, RefreshKind, System};
 
 mod hardware;
 mod sysinfo_ext;
@@ -71,8 +71,13 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Initialize system info
+    // Initialize system info. Process CPU accounting stays on `sys`: sysinfo
+    // derives it from the latest CPU delta in the same System, so that delta
+    // must cover the process refresh window rather than the 1s CPU UI window.
     let mut sys = System::new_all();
+    let mut cpu_sys = System::new_with_specifics(
+        RefreshKind::new().with_cpu(CpuRefreshKind::everything()),
+    );
     let mut networks = Networks::new_with_refreshed_list();
     let mut disks = Disks::new_with_refreshed_list();
 
@@ -81,7 +86,7 @@ fn main() -> Result<()> {
     let mut last_process_update = Instant::now();
     let mut last_network_update = Instant::now();
 
-    let result = run_app(&mut terminal, &mut sys, &mut networks, &mut disks, &mut app_state, &mut last_update, &mut last_process_update, &mut last_network_update);
+    let result = run_app(&mut terminal, &mut sys, &mut cpu_sys, &mut networks, &mut disks, &mut app_state, &mut last_update, &mut last_process_update, &mut last_network_update);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -112,9 +117,12 @@ struct AppState {
     rga_version: String,
     rknn_version: String,
     rkllm_version: String,
+    // Restores MPP load accounting when the app exits
+    _vpu_load_guard: Option<VpuLoadIntervalGuard>,
     // Cached hardware availability
     has_gpu: bool,
     has_npu: bool,
+    has_vpu: bool,
     has_rga: bool,
     // Cached CPU frequency ranges (don't change at runtime)
     cpu_freq_ranges: Vec<(u32, u32)>,
@@ -170,6 +178,9 @@ impl AppState {
         // nothing until it has two samples to compare.
         let has_gpu = gpu_present();
         let has_npu = !get_npu_load().is_empty();
+        let vpu_load_guard = init_vpu_load();
+        let has_vpu = vpu_load_guard.is_some()
+            && get_vpu_load().is_some_and(|engines| has_displayable_vpu(&engines));
         let has_rga = get_rga_load().is_some();
 
         // Cache CPU frequency ranges (don't change at runtime)
@@ -198,8 +209,10 @@ impl AppState {
             rga_version,
             rknn_version,
             rkllm_version,
+            _vpu_load_guard: vpu_load_guard,
             has_gpu,
             has_npu,
+            has_vpu,
             has_rga,
             cpu_freq_ranges,
             network_adapters,
@@ -417,6 +430,7 @@ impl AppState {
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     sys: &mut System,
+    cpu_sys: &mut System,
     networks: &mut Networks,
     disks: &mut Disks,
     app_state: &mut AppState,
@@ -431,7 +445,7 @@ fn run_app(
         // Update system info based on configured rate
         let mut should_render = false;
         if last_update.elapsed() >= Duration::from_secs(config.cpu_memory) {
-            sys.refresh_cpu_all();
+            cpu_sys.refresh_cpu_all();
             sys.refresh_memory();
             app_state.update_cpu_stats(); // Update CPU stats (context switches, interrupts)
             app_state.update_stats(); // Update governor and TCP connections (throttled internally)
@@ -469,7 +483,7 @@ fn run_app(
 
         // Render at most once per second, or immediately after data update
         if should_render || last_render.elapsed() >= Duration::from_secs(1) {
-            terminal.draw(|f| ui(f, sys, app_state))?;
+            terminal.draw(|f| ui(f, sys, cpu_sys, app_state))?;
             last_render = Instant::now();
         }
 
@@ -547,7 +561,7 @@ fn run_app(
     }
 }
 
-fn ui(f: &mut Frame, sys: &System, app_state: &AppState) {
+fn ui(f: &mut Frame, sys: &System, cpu_sys: &System, app_state: &AppState) {
     let size = f.area();
 
     // Main layout: top and bottom
@@ -574,7 +588,7 @@ fn ui(f: &mut Frame, sys: &System, app_state: &AppState) {
         .constraints([Constraint::Min(10), Constraint::Length(8)])
         .split(top_chunks[0]);
 
-    render_cpu_panel(f, left_top_chunks[0], sys, app_state);
+    render_cpu_panel(f, left_top_chunks[0], cpu_sys, app_state);
     render_memory_panel(f, left_top_chunks[1], sys);
 
     // Right top: System info and accelerators
@@ -806,7 +820,12 @@ fn render_right_panels(f: &mut Frame, area: Rect, app_state: &AppState, sys: &Sy
         constraints.push(Constraint::Length(6)); // Increased for sparkline
     }
     if app_state.has_npu {
-        constraints.push(Constraint::Length(7)); // Increased for sparkline
+        // Always preserve three core rows and borders; history can clip first.
+        constraints.push(Constraint::Min(5));
+    }
+    if app_state.has_vpu {
+        // Preserve the decode and encode rows on short terminals.
+        constraints.push(Constraint::Min(4));
     }
     if app_state.has_rga {
         constraints.push(Constraint::Length(5));
@@ -836,6 +855,12 @@ fn render_right_panels(f: &mut Frame, area: Rect, app_state: &AppState, sys: &Sy
     // NPU
     if app_state.has_npu {
         render_npu_panel(f, chunks[chunk_idx], app_state);
+        chunk_idx += 1;
+    }
+
+    // VPU
+    if app_state.has_vpu {
+        render_vpu_panel(f, chunks[chunk_idx]);
         chunk_idx += 1;
     }
 
@@ -997,6 +1022,69 @@ fn render_npu_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Green));
 
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
+}
+
+fn has_displayable_vpu(engines: &[VpuEngine]) -> bool {
+    engines
+        .iter()
+        .any(|engine| is_vpu_decoder(&engine.name) || is_vpu_encoder(&engine.name))
+}
+
+fn is_vpu_decoder(name: &str) -> bool {
+    ["rkvdec", "vdpu", "av1d", "avsd", "jpegd"]
+        .iter()
+        .any(|kind| name.starts_with(kind))
+}
+
+fn is_vpu_encoder(name: &str) -> bool {
+    ["rkvenc", "vepu", "jpege"]
+        .iter()
+        .any(|kind| name.starts_with(kind))
+}
+
+fn render_vpu_panel(f: &mut Frame, area: Rect) {
+    let engines = match get_vpu_load() {
+        Some(engines) => engines,
+        None => return,
+    };
+
+    // Keep the panel compact by showing the busiest decoder and encoder.
+    let mut lines = Vec::new();
+    for (label, decoder) in [("Dec", true), ("Enc", false)] {
+        let peak = engines
+            .iter()
+            .filter(|engine| {
+                if decoder {
+                    is_vpu_decoder(&engine.name)
+                } else {
+                    is_vpu_encoder(&engine.name)
+                }
+            })
+            .max_by(|a, b| a.utilization.total_cmp(&b.utilization));
+
+        if let Some(engine) = peak {
+            let bar_width = 16;
+            let filled =
+                ((engine.utilization.clamp(0.0, 100.0) / 100.0) * bar_width as f32) as usize;
+            let bar = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+            lines.push(Line::from(vec![
+                Span::raw(format!("{:<3} {:<12} ", label, engine.name)),
+                Span::styled(bar, Style::default().fg(Color::Green)),
+                Span::raw(format!(" {:>5.1}%", engine.utilization)),
+            ]));
+        }
+    }
+
+    if lines.is_empty() {
+        return;
+    }
+
+    let block = Block::default()
+        .title("VPU (peak)")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
 }
@@ -1411,4 +1499,31 @@ fn format_number(num: u64) -> String {
         return format!("{:.1}M", num as f64 / 1_000_000.0);
     }
     format!("{:.1}G", num as f64 / 1_000_000_000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_displayable_vpu;
+    use crate::hardware::VpuEngine;
+
+    #[test]
+    fn vpu_availability_requires_a_codec_engine() {
+        let iep = VpuEngine {
+            name: "iep0".to_string(),
+            utilization: 0.0,
+        };
+        assert!(!has_displayable_vpu(&[iep]));
+
+        let decoder = VpuEngine {
+            name: "rkvdec-core0".to_string(),
+            utilization: 0.0,
+        };
+        assert!(has_displayable_vpu(&[decoder]));
+
+        let encoder = VpuEngine {
+            name: "rkvenc-core0".to_string(),
+            utilization: 0.0,
+        };
+        assert!(has_displayable_vpu(&[encoder]));
+    }
 }

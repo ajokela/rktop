@@ -704,6 +704,102 @@ pub fn get_npu_load() -> Vec<u8> {
     Vec::new()
 }
 
+#[derive(Debug, Clone)]
+pub struct VpuEngine {
+    pub name: String,
+    pub utilization: f32,
+}
+
+const MPP_LOAD_PATH: &str = "/proc/mpp_service/load";
+const MPP_LOAD_INTERVAL_PATH: &str = "/proc/mpp_service/load_interval";
+
+/// Restores MPP load accounting when rktop enabled it, provided another
+/// client has not changed the setting in the meantime.
+pub struct VpuLoadIntervalGuard {
+    path: PathBuf,
+    restore_to: Option<u32>,
+    expected: u32,
+}
+
+impl Drop for VpuLoadIntervalGuard {
+    fn drop(&mut self) {
+        let Some(original) = self.restore_to else {
+            return;
+        };
+        let Ok(current) = fs::read_to_string(&self.path) else {
+            return;
+        };
+        if current.trim().parse::<u32>() == Ok(self.expected) {
+            let _ = fs::write(&self.path, format!("{}\n", original));
+        }
+    }
+}
+
+/// Enable the kernel's MPP load accounting if it is available and disabled.
+/// The returned guard restores the previous setting when dropped.
+pub fn init_vpu_load() -> Option<VpuLoadIntervalGuard> {
+    let interval = fs::read_to_string(MPP_LOAD_INTERVAL_PATH).ok()?;
+    let interval = interval.trim().parse::<u32>().ok()?;
+    let (restore_to, expected) = if interval == 0 {
+        fs::write(MPP_LOAD_INTERVAL_PATH, "1000\n").ok()?;
+        (Some(0), 1000)
+    } else {
+        (None, interval)
+    };
+
+    Some(VpuLoadIntervalGuard {
+        path: PathBuf::from(MPP_LOAD_INTERVAL_PATH),
+        restore_to,
+        expected,
+    })
+}
+
+fn parse_mpp_percent(value: Option<&str>) -> Option<f32> {
+    value?.strip_suffix('%')?.parse().ok()
+}
+
+fn parse_mpp_load(content: &str) -> Vec<VpuEngine> {
+    let mut core_indices: HashMap<String, usize> = HashMap::new();
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let device = parts.next()?;
+            if parts.next()? != "load:" {
+                return None;
+            }
+            // Load includes task scheduling time. Utilization measures actual
+            // hardware busy time, which is the more useful VPU usage metric.
+            let _load = parse_mpp_percent(parts.next())?;
+            if parts.next()? != "utilization:" {
+                return None;
+            }
+            let utilization = parse_mpp_percent(parts.next())?;
+
+            let base_name = device.rsplit('.').next().unwrap_or(device);
+            let core_index = core_indices.get(base_name).copied().unwrap_or(0);
+            core_indices.insert(base_name.to_string(), core_index + 1);
+
+            Some(VpuEngine {
+                name: format!("{}{}", base_name, core_index),
+                utilization,
+            })
+        })
+        .collect()
+}
+
+/// Read VPU hardware utilization from Rockchip's MPP procfs interface.
+pub fn get_vpu_load() -> Option<Vec<VpuEngine>> {
+    let content = read_cached_file(MPP_LOAD_PATH).ok()?;
+    let engines = parse_mpp_load(&content);
+    if engines.is_empty() {
+        None
+    } else {
+        Some(engines)
+    }
+}
+
 /// Read RGA (Rockchip Graphics Accelerator) load (using cached file descriptors)
 /// Returns a map of scheduler names to load percentages
 pub fn get_rga_load() -> Option<Vec<(String, f32)>> {
@@ -975,8 +1071,9 @@ pub fn get_librkllmrt_version() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::preserve_engine_high_water;
+    use super::{parse_mpp_load, preserve_engine_high_water, VpuLoadIntervalGuard};
     use std::collections::HashMap;
+    use std::fs;
 
     #[test]
     fn drm_engine_counters_keep_the_previous_high_water() {
@@ -998,5 +1095,55 @@ mod tests {
         preserve_engine_high_water(&mut totals, &previous);
         assert_eq!(totals[&key], 11);
         assert_eq!(totals[&key].saturating_sub(previous[&key]), 1);
+    }
+
+    #[test]
+    fn mpp_load_parser_handles_multiple_cores() {
+        let content = concat!(
+            "fdbd0000.rkvenc-core      load:  98.26% utilization:  97.25%\n",
+            "fdbe0000.rkvenc-core      load:  10.78% utilization:  10.69%\n",
+            "fdc38100.rkvdec-core      load:  17.41% utilization:  17.09%\n",
+            "fdc48100.rkvdec-core      load:  17.64% utilization:  17.30%\n",
+            "not a load line\n",
+        );
+
+        let engines = parse_mpp_load(content);
+        assert_eq!(engines.len(), 4);
+        assert_eq!(engines[0].name, "rkvenc-core0");
+        assert_eq!(engines[0].utilization, 97.25);
+        assert_eq!(engines[1].name, "rkvenc-core1");
+        assert_eq!(engines[1].utilization, 10.69);
+        assert_eq!(engines[2].name, "rkvdec-core0");
+        assert_eq!(engines[3].name, "rkvdec-core1");
+    }
+
+    #[test]
+    fn vpu_interval_guard_restores_only_an_unchanged_setting() {
+        let path = std::env::temp_dir().join(format!(
+            "rktop-vpu-load-interval-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "1000\n").unwrap();
+
+        let guard = VpuLoadIntervalGuard {
+            path: path.clone(),
+            restore_to: Some(0),
+            expected: 1000,
+        };
+        drop(guard);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "0\n");
+
+        // Do not overwrite an interval changed by another client.
+        fs::write(&path, "1000\n").unwrap();
+        let guard = VpuLoadIntervalGuard {
+            path: path.clone(),
+            restore_to: Some(0),
+            expected: 1000,
+        };
+        fs::write(&path, "500\n").unwrap();
+        drop(guard);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "500\n");
+
+        let _ = fs::remove_file(path);
     }
 }

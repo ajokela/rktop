@@ -10,6 +10,7 @@ A high-performance system monitoring tool specifically designed for Rockchip SoC
 - **CPU**: Per-core usage, frequencies, time breakdown (user/system/iowait/idle)
 - **GPU (Mali)**: Utilization percentage and frequency
 - **NPU**: Per-core load and frequency
+- **VPU**: Peak decode and encode hardware utilization via Rockchip MPP
 - **RGA**: Graphics accelerator scheduler load (shows all RGA cores)
 - **Memory**: RAM, Swap, and ZRAM usage with detailed statistics
 - **Temperatures**: All thermal sensors (CPU, GPU, NPU, etc.)
@@ -39,7 +40,7 @@ Optimized for minimal CPU overhead:
 - **<1% CPU usage** during normal operation
 - Cached static information (versions, hardware availability)
 - UID-to-username caching (eliminates process spawns)
-- Throttled refresh rates (1s/2s/3s/5s for different data types)
+- Throttled refresh rates (1s/2s/5s for different data types)
 - Efficient hardware detection (checks availability once at startup)
 
 ## Installation
@@ -137,8 +138,13 @@ rktop
 - Current GPU frequency
 
 ### NPU Panel (if available)
-- Per-core NPU load (0-2 cores typical)
+- Per-core NPU load (3 cores on RK3588)
 - NPU frequency
+
+### VPU Panel (if available)
+- Peak hardware utilization for decode and encode engines
+- Uses the Rockchip MPP interface on supported BSP kernels
+- Enables MPP load accounting at a 1000 ms interval if needed, then restores the prior setting on exit unless another client changed it
 
 ### RGA Panel (if available)
 - Per-scheduler load for all RGA cores
@@ -195,7 +201,7 @@ rktop
 **Throttled Refresh Intervals**
 - CPU/Memory: 1 second
 - Network/Disk I/O: 2 seconds
-- Processes: 3 seconds
+- Processes: 2 seconds (with a matching process-local CPU sampling window)
 - Stats (uptime, load, governor, TCP): 5 seconds
 
 **Graceful Hardware Detection**
@@ -217,6 +223,10 @@ The tool reads from Rockchip-specific kernel interfaces:
 - `/sys/kernel/debug/mali0/` - GPU utilization
 - `/sys/kernel/debug/rknpu/` - NPU load and version
 - `/sys/kernel/debug/rkrga/` - RGA load and version
+
+**Procfs** (Rockchip BSP kernels):
+- `/proc/mpp_service/load` - VPU decode and encode utilization
+- `/proc/mpp_service/load_interval` - Temporarily set to 1000 ms by rktop when load accounting is disabled
 
 **Sysfs** (standard access):
 - `/sys/devices/platform/fb000000.gpu-panthor/devfreq/` - GPU frequency
