@@ -355,13 +355,17 @@ pub fn get_gpu_engine_usage() -> Vec<(String, f32)> {
         .filter(|p| p.scanned_at.elapsed().as_millis() < CLIENT_RESCAN_INTERVAL_MS)
         .map(|p| (p.clients.clone(), p.scanned_at));
 
-    let (clients, scanned_at, totals) = match cached {
+    let (clients, scanned_at, mut totals) = match cached {
         Some((clients, scanned_at)) => match accumulate_engines(&clients) {
             (totals, true) => (clients, scanned_at, totals),
             _ => rescan_drm_clients(),
         },
         None => rescan_drm_clients(),
     };
+
+    if let Some(prev) = guard.as_ref() {
+        preserve_engine_high_water(&mut totals, &prev.totals);
+    }
 
     let now = Instant::now();
     let result = match guard.as_ref() {
@@ -405,6 +409,19 @@ pub fn get_gpu_engine_usage() -> Vec<(String, f32)> {
     });
 
     result
+}
+
+/// DRM engine counters may temporarily decrease. Keep the previous high-water
+/// value until the driver reports a monotonic update, as required by fdinfo.
+fn preserve_engine_high_water(
+    totals: &mut HashMap<(String, String), u64>,
+    previous: &HashMap<(String, String), u64>,
+) {
+    for (key, total) in totals {
+        if let Some(previous_total) = previous.get(key) {
+            *total = (*total).max(*previous_total);
+        }
+    }
 }
 
 fn rescan_drm_clients() -> (Vec<PathBuf>, Instant, HashMap<(String, String), u64>) {
@@ -954,4 +971,32 @@ pub fn get_librknnrt_version() -> String {
 /// Read librkllmrt library version
 pub fn get_librkllmrt_version() -> String {
     extract_version_from_binary("/usr/lib/librkllmrt.so", "RKLLM SDK (version:")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preserve_engine_high_water;
+    use std::collections::HashMap;
+
+    #[test]
+    fn drm_engine_counters_keep_the_previous_high_water() {
+        let key = ("client-1".to_string(), "fragment".to_string());
+        let new_key = ("client-2".to_string(), "fragment".to_string());
+        let previous = HashMap::from([(key.clone(), 10)]);
+
+        // A temporary dip and the subsequent catch-up both produce no delta.
+        for reported in [9, 10] {
+            let mut totals = HashMap::from([(key.clone(), reported), (new_key.clone(), 7)]);
+            preserve_engine_high_water(&mut totals, &previous);
+            assert_eq!(totals[&key], 10);
+            assert_eq!(totals[&key].saturating_sub(previous[&key]), 0);
+            assert_eq!(totals[&new_key], 7);
+        }
+
+        // Only a genuine increase beyond the high-water value produces a delta.
+        let mut totals = HashMap::from([(key.clone(), 11)]);
+        preserve_engine_high_water(&mut totals, &previous);
+        assert_eq!(totals[&key], 11);
+        assert_eq!(totals[&key].saturating_sub(previous[&key]), 1);
+    }
 }
