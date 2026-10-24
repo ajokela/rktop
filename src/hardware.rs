@@ -704,6 +704,80 @@ pub fn get_npu_load() -> Vec<u8> {
     Vec::new()
 }
 
+#[derive(Debug, Clone)]
+pub struct VpuEngine {
+    pub name: String,
+    pub utilization: f32,
+}
+
+const MPP_LOAD_PATH: &str = "/proc/mpp_service/load";
+const MPP_LOAD_INTERVAL_PATH: &str = "/proc/mpp_service/load_interval";
+
+/// Enable the kernel's MPP load accounting if it is available and disabled.
+fn enable_vpu_load() -> bool {
+    let interval = match fs::read_to_string(MPP_LOAD_INTERVAL_PATH) {
+        Ok(content) => content,
+        Err(_) => return false,
+    };
+
+    match interval.trim().parse::<u32>() {
+        Ok(0) => fs::write(MPP_LOAD_INTERVAL_PATH, "1000\n").is_ok(),
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+fn parse_mpp_percent(value: Option<&str>) -> Option<f32> {
+    value?.strip_suffix('%')?.parse().ok()
+}
+
+fn parse_mpp_load(content: &str) -> Vec<VpuEngine> {
+    let mut core_indices: HashMap<String, usize> = HashMap::new();
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let device = parts.next()?;
+            if parts.next()? != "load:" {
+                return None;
+            }
+            // Load includes task scheduling time. Utilization measures actual
+            // hardware busy time, which is the more useful VPU usage metric.
+            let _load = parse_mpp_percent(parts.next())?;
+            if parts.next()? != "utilization:" {
+                return None;
+            }
+            let utilization = parse_mpp_percent(parts.next())?;
+
+            let base_name = device.rsplit('.').next().unwrap_or(device);
+            let core_index = core_indices.get(base_name).copied().unwrap_or(0);
+            core_indices.insert(base_name.to_string(), core_index + 1);
+
+            Some(VpuEngine {
+                name: format!("{}{}", base_name, core_index),
+                utilization,
+            })
+        })
+        .collect()
+}
+
+/// Read VPU hardware utilization from Rockchip's MPP procfs interface.
+pub fn get_vpu_load() -> Option<Vec<VpuEngine>> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(enable_vpu_load) {
+        return None;
+    }
+
+    let content = read_cached_file(MPP_LOAD_PATH).ok()?;
+    let engines = parse_mpp_load(&content);
+    if engines.is_empty() {
+        None
+    } else {
+        Some(engines)
+    }
+}
+
 /// Read RGA (Rockchip Graphics Accelerator) load (using cached file descriptors)
 /// Returns a map of scheduler names to load percentages
 pub fn get_rga_load() -> Option<Vec<(String, f32)>> {
@@ -975,7 +1049,7 @@ pub fn get_librkllmrt_version() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::preserve_engine_high_water;
+    use super::{parse_mpp_load, preserve_engine_high_water};
     use std::collections::HashMap;
 
     #[test]
@@ -998,5 +1072,25 @@ mod tests {
         preserve_engine_high_water(&mut totals, &previous);
         assert_eq!(totals[&key], 11);
         assert_eq!(totals[&key].saturating_sub(previous[&key]), 1);
+    }
+
+    #[test]
+    fn mpp_load_parser_handles_multiple_cores() {
+        let content = concat!(
+            "fdbd0000.rkvenc-core      load:  98.26% utilization:  97.25%\n",
+            "fdbe0000.rkvenc-core      load:  10.78% utilization:  10.69%\n",
+            "fdc38100.rkvdec-core      load:  17.41% utilization:  17.09%\n",
+            "fdc48100.rkvdec-core      load:  17.64% utilization:  17.30%\n",
+            "not a load line\n",
+        );
+
+        let engines = parse_mpp_load(content);
+        assert_eq!(engines.len(), 4);
+        assert_eq!(engines[0].name, "rkvenc-core0");
+        assert_eq!(engines[0].utilization, 97.25);
+        assert_eq!(engines[1].name, "rkvenc-core1");
+        assert_eq!(engines[1].utilization, 10.69);
+        assert_eq!(engines[2].name, "rkvdec-core0");
+        assert_eq!(engines[3].name, "rkvdec-core1");
     }
 }
