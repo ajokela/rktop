@@ -144,7 +144,7 @@ rktop
 ### VPU Panel (if available)
 - Peak hardware utilization for decode and encode engines
 - Uses the Rockchip MPP interface on supported BSP kernels
-- Enables MPP load accounting at a 1000 ms interval if it is disabled
+- Enables MPP load accounting at a 1000 ms interval if needed, then restores the prior setting on exit unless another client changed it
 
 ### RGA Panel (if available)
 - Per-scheduler load for all RGA cores
@@ -226,7 +226,7 @@ The tool reads from Rockchip-specific kernel interfaces:
 
 **Procfs** (Rockchip BSP kernels):
 - `/proc/mpp_service/load` - VPU decode and encode utilization
-- `/proc/mpp_service/load_interval` - Set to 1000 ms by rktop when load accounting is disabled
+- `/proc/mpp_service/load_interval` - Temporarily set to 1000 ms by rktop when load accounting is disabled
 
 **Sysfs** (standard access):
 - `/sys/devices/platform/fb000000.gpu-panthor/devfreq/` - GPU frequency

@@ -117,6 +117,8 @@ struct AppState {
     rga_version: String,
     rknn_version: String,
     rkllm_version: String,
+    // Restores MPP load accounting when the app exits
+    _vpu_load_guard: Option<VpuLoadIntervalGuard>,
     // Cached hardware availability
     has_gpu: bool,
     has_npu: bool,
@@ -176,7 +178,9 @@ impl AppState {
         // nothing until it has two samples to compare.
         let has_gpu = gpu_present();
         let has_npu = !get_npu_load().is_empty();
-        let has_vpu = get_vpu_load().is_some();
+        let vpu_load_guard = init_vpu_load();
+        let has_vpu = vpu_load_guard.is_some()
+            && get_vpu_load().is_some_and(|engines| has_displayable_vpu(&engines));
         let has_rga = get_rga_load().is_some();
 
         // Cache CPU frequency ranges (don't change at runtime)
@@ -205,6 +209,7 @@ impl AppState {
             rga_version,
             rknn_version,
             rkllm_version,
+            _vpu_load_guard: vpu_load_guard,
             has_gpu,
             has_npu,
             has_vpu,
@@ -1021,6 +1026,12 @@ fn render_npu_panel(f: &mut Frame, area: Rect, app_state: &AppState) {
     f.render_widget(paragraph, area);
 }
 
+fn has_displayable_vpu(engines: &[VpuEngine]) -> bool {
+    engines
+        .iter()
+        .any(|engine| is_vpu_decoder(&engine.name) || is_vpu_encoder(&engine.name))
+}
+
 fn is_vpu_decoder(name: &str) -> bool {
     ["rkvdec", "vdpu", "av1d", "avsd", "jpegd"]
         .iter()
@@ -1488,4 +1499,31 @@ fn format_number(num: u64) -> String {
         return format!("{:.1}M", num as f64 / 1_000_000.0);
     }
     format!("{:.1}G", num as f64 / 1_000_000_000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_displayable_vpu;
+    use crate::hardware::VpuEngine;
+
+    #[test]
+    fn vpu_availability_requires_a_codec_engine() {
+        let iep = VpuEngine {
+            name: "iep0".to_string(),
+            utilization: 0.0,
+        };
+        assert!(!has_displayable_vpu(&[iep]));
+
+        let decoder = VpuEngine {
+            name: "rkvdec-core0".to_string(),
+            utilization: 0.0,
+        };
+        assert!(has_displayable_vpu(&[decoder]));
+
+        let encoder = VpuEngine {
+            name: "rkvenc-core0".to_string(),
+            utilization: 0.0,
+        };
+        assert!(has_displayable_vpu(&[encoder]));
+    }
 }

@@ -713,18 +713,45 @@ pub struct VpuEngine {
 const MPP_LOAD_PATH: &str = "/proc/mpp_service/load";
 const MPP_LOAD_INTERVAL_PATH: &str = "/proc/mpp_service/load_interval";
 
+/// Restores MPP load accounting when rktop enabled it, provided another
+/// client has not changed the setting in the meantime.
+pub struct VpuLoadIntervalGuard {
+    path: PathBuf,
+    restore_to: Option<u32>,
+    expected: u32,
+}
+
+impl Drop for VpuLoadIntervalGuard {
+    fn drop(&mut self) {
+        let Some(original) = self.restore_to else {
+            return;
+        };
+        let Ok(current) = fs::read_to_string(&self.path) else {
+            return;
+        };
+        if current.trim().parse::<u32>() == Ok(self.expected) {
+            let _ = fs::write(&self.path, format!("{}\n", original));
+        }
+    }
+}
+
 /// Enable the kernel's MPP load accounting if it is available and disabled.
-fn enable_vpu_load() -> bool {
-    let interval = match fs::read_to_string(MPP_LOAD_INTERVAL_PATH) {
-        Ok(content) => content,
-        Err(_) => return false,
+/// The returned guard restores the previous setting when dropped.
+pub fn init_vpu_load() -> Option<VpuLoadIntervalGuard> {
+    let interval = fs::read_to_string(MPP_LOAD_INTERVAL_PATH).ok()?;
+    let interval = interval.trim().parse::<u32>().ok()?;
+    let (restore_to, expected) = if interval == 0 {
+        fs::write(MPP_LOAD_INTERVAL_PATH, "1000\n").ok()?;
+        (Some(0), 1000)
+    } else {
+        (None, interval)
     };
 
-    match interval.trim().parse::<u32>() {
-        Ok(0) => fs::write(MPP_LOAD_INTERVAL_PATH, "1000\n").is_ok(),
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    Some(VpuLoadIntervalGuard {
+        path: PathBuf::from(MPP_LOAD_INTERVAL_PATH),
+        restore_to,
+        expected,
+    })
 }
 
 fn parse_mpp_percent(value: Option<&str>) -> Option<f32> {
@@ -764,11 +791,6 @@ fn parse_mpp_load(content: &str) -> Vec<VpuEngine> {
 
 /// Read VPU hardware utilization from Rockchip's MPP procfs interface.
 pub fn get_vpu_load() -> Option<Vec<VpuEngine>> {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(enable_vpu_load) {
-        return None;
-    }
-
     let content = read_cached_file(MPP_LOAD_PATH).ok()?;
     let engines = parse_mpp_load(&content);
     if engines.is_empty() {
@@ -1049,8 +1071,9 @@ pub fn get_librkllmrt_version() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mpp_load, preserve_engine_high_water};
+    use super::{parse_mpp_load, preserve_engine_high_water, VpuLoadIntervalGuard};
     use std::collections::HashMap;
+    use std::fs;
 
     #[test]
     fn drm_engine_counters_keep_the_previous_high_water() {
@@ -1092,5 +1115,35 @@ mod tests {
         assert_eq!(engines[1].utilization, 10.69);
         assert_eq!(engines[2].name, "rkvdec-core0");
         assert_eq!(engines[3].name, "rkvdec-core1");
+    }
+
+    #[test]
+    fn vpu_interval_guard_restores_only_an_unchanged_setting() {
+        let path = std::env::temp_dir().join(format!(
+            "rktop-vpu-load-interval-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "1000\n").unwrap();
+
+        let guard = VpuLoadIntervalGuard {
+            path: path.clone(),
+            restore_to: Some(0),
+            expected: 1000,
+        };
+        drop(guard);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "0\n");
+
+        // Do not overwrite an interval changed by another client.
+        fs::write(&path, "1000\n").unwrap();
+        let guard = VpuLoadIntervalGuard {
+            path: path.clone(),
+            restore_to: Some(0),
+            expected: 1000,
+        };
+        fs::write(&path, "500\n").unwrap();
+        drop(guard);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "500\n");
+
+        let _ = fs::remove_file(path);
     }
 }
